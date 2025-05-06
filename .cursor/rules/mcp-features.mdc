@@ -1,0 +1,47 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# 模型上下文协议(MCP)功能
+
+本项目实现了符合模型上下文协议(Model Context Protocol)的服务端，用于提供知识库查询工具。
+
+## MCP工具
+
+项目通过Spring AI的`@Tool`注解将服务方法暴露为MCP工具：
+
+```java
+@Tool(description = "在知识库中搜索信息，根据提供的查询词返回相关文档")
+List<Map<String, Object>> searchKnowledgeBase(String query, Integer limit);
+```
+
+## 配置
+
+MCP服务器配置位于[application.yml](mdc:src/main/resources/application.yml)，主要包括：
+
+```yaml
+spring:
+  ai:
+    mcp:
+      server:
+        enabled: true
+        name: "MaxKB MCP Server"
+        version: "1.0.0"
+        type: ASYNC
+        sse-endpoint: /sse
+        sse-message-endpoint: /mcp/message
+```
+
+## 工具注册
+
+工具注册在[MaxKbMcpServerApplication](mdc:src/main/java/com/example/mcpserver/MaxKbMcpServerApplication.java)中配置：
+
+```java
+@Bean
+public ToolCallbackProvider toolCallbackProvider(KnowledgeBaseService knowledgeBaseService) {
+    return MethodToolCallbackProvider.builder()
+            .toolObjects(knowledgeBaseService)
+            .build();
+}
+```

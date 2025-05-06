@@ -1,0 +1,30 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# 项目架构
+
+## 包结构
+
+- `com.example.mcpserver`: 根包
+  - `config`: 应用配置类
+  - `controller`: REST控制器
+  - `service`: 服务接口和实现
+
+## 关键组件
+
+### 配置
+
+- [AppConfig](mdc:src/main/java/com/example/mcpserver/config/AppConfig.java): 基础应用配置
+- [MaxKbConfig](mdc:src/main/java/com/example/mcpserver/config/MaxKbConfig.java): MaxKB服务连接配置
+- [WebConfig](mdc:src/main/java/com/example/mcpserver/config/WebConfig.java): Web相关配置
+
+### 服务
+
+- [KnowledgeBaseService](mdc:src/main/java/com/example/mcpserver/service/KnowledgeBaseService.java): 知识库查询服务接口
+- 知识库服务实现位于 `service/impl` 包中
+
+### 控制器
+
+- [HealthCheckController](mdc:src/main/java/com/example/mcpserver/controller/HealthCheckController.java): 健康检查接口

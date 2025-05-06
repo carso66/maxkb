@@ -1,0 +1,39 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# 开发指南
+
+## 环境要求
+
+- Java 17
+- Maven 3.8+
+- 有效的MaxKB API密钥
+
+## 本地开发
+
+1. 克隆仓库
+2. 配置`application.yml`中的MaxKB API密钥
+3. 使用Maven构建：`mvn clean package`
+4. 运行应用：`java -jar target/mcp-server-0.0.1-SNAPSHOT.jar`
+
+## API端点
+
+- MCP服务端点: `/mcp/message`
+- SSE端点: `/sse`
+- 健康检查: `/actuator/health`
+
+## 添加新工具
+
+如需添加新的MCP工具，请按以下步骤操作：
+
+1. 在服务接口中添加方法并使用`@Tool`注解
+2. 在服务实现中实现该方法
+3. 确保在`MaxKbMcpServerApplication`中注册了包含新工具的服务
+
+示例：
+```java
+@Tool(description = "工具描述")
+Map<String, Object> newToolMethod(String param1, Integer param2);
+```

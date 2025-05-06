@@ -1,0 +1,35 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# 知识库服务
+
+知识库服务是本项目的核心功能，提供与MaxKB知识库的交互能力。
+
+## 接口定义
+
+[KnowledgeBaseService](mdc:src/main/java/com/example/mcpserver/service/KnowledgeBaseService.java)定义了以下主要功能：
+
+- `searchKnowledgeBase`: 在知识库中搜索信息
+- `getDocumentById`: 获取文档详情
+- `listKnowledgeBases`: 列出所有可用知识库
+- `searchInKnowledgeBase`: 在指定知识库中搜索
+
+## 服务实现
+
+服务实现位于[KnowledgeBaseServiceImpl](mdc:src/main/java/com/example/mcpserver/service/impl/KnowledgeBaseServiceImpl.java)，
+处理与MaxKB API的实际通信逻辑。
+
+## 配置
+
+MaxKB服务的连接配置定义在[MaxKbConfig](mdc:src/main/java/com/example/mcpserver/config/MaxKbConfig.java)：
+
+```yaml
+maxkb:
+  api-base-url: http://maxkb-pro.demo.xyb2b.com/
+  api-key: application-ddff0a26711de6a5d42d014baeb84717
+  connect-timeout: 5000
+  request-timeout: 30000
+  max-connections: 20
+```

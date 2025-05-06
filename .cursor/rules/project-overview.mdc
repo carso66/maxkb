@@ -1,0 +1,21 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# MaxKB 2.0 MCP服务器
+
+这是MaxKB 2.0的模型上下文协议(MCP)服务器，为AI助手提供知识库查询能力。
+
+## 核心文件
+
+- 入口点: [src/main/java/com/example/mcpserver/MaxKbMcpServerApplication.java](mdc:src/main/java/com/example/mcpserver/MaxKbMcpServerApplication.java)
+- 配置文件: [src/main/resources/application.yml](mdc:src/main/resources/application.yml)
+- Maven配置: [pom.xml](mdc:pom.xml)
+
+## 技术栈
+
+- Spring Boot 3.2.0
+- Spring AI (模型上下文协议支持)
+- Spring WebFlux (反应式Web框架)
+- Java 17

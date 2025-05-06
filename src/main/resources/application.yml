@@ -1,0 +1,38 @@
+server:
+  port: 8090
+  
+spring:
+  application:
+    name: maxkb-mcp-server
+  ai:
+    mcp:
+      server:
+        enabled: true
+        name: "MaxKB MCP Server"
+        version: "1.0.0"
+        type: ASYNC
+        sse-endpoint: /sse
+        sse-message-endpoint: /mcp/message
+        resource-change-notification: true
+        tool-change-notification: true
+        prompt-change-notification: true
+
+# MaxKB配置
+maxkb:
+  api-base-url: maxkb-url
+  api-key: api-key
+  connect-timeout: 5000
+  request-timeout: 30000
+  max-connections: 20
+  default-search-limit: 10
+  default-similarity-threshold: 0.6
+  default-search-mode: embedding
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.example.mcpserver: DEBUG
+    org.springframework.ai: DEBUG
+    org.springframework.web.reactive: DEBUG
+    io.modelcontextprotocol: DEBUG 
