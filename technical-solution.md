@@ -1484,491 +1484,705 @@ flowchart TD
 
 ### 核心架构决策
 
-基于CREATIVE模式的深入分析，确定了以下关键架构方案：
+基于对现有技术栈和实际需求的深入分析，重新设计WebSocket实现方案：
 
-#### 12.1 WebSocket集群架构设计
+#### 12.1 Spring WebSocket + STOMP深度分析
 
-**问题**: 在多实例集群环境下，WebSocket连接是有状态的，需要解决消息路由和连接管理问题。
+##### STOMP协议原理与问题
 
-**方案对比**:
+**STOMP（Simple Text Oriented Messaging Protocol）是什么？**
+```mermaid
+graph TD
+    A[客户端] -->|CONNECT| B[WebSocket连接]
+    B -->|CONNECTED| A
+    A -->|SUBSCRIBE /topic/chat| C[消息代理]
+    A -->|SEND /app/sendMessage| D[应用处理器]
+    D -->|业务处理| E[MessageMapping方法]
+    E -->|@SendTo| C
+    C -->|MESSAGE| A
+```
 
-| 方案 | 描述 | 优点 | 缺点 | 适用场景 |
-|------|------|------|------|----------|
-| 粘性会话+Redis广播 | 负载均衡器粘性会话，Redis发布订阅 | 实现简单，技术成熟 | 实例故障影响用户 | 中小规模，快速上线 |
-| WebSocket网关 | 独立WebSocket网关层 | 连接集中管理 | 架构复杂，单点风险 | 大规模，专业团队 |
-| 一致性哈希 | 用户分配到特定实例 | 负载均匀，动态扩展 | 实现复杂，重连成本 | 大规模，高可用要求 |
-
-**选择方案**: **粘性会话 + Redis广播**
-- 与现有Spring Boot + Redis技术栈完美匹配
-- 实现复杂度低，可快速上线
-- 支持渐进式升级到更复杂架构
-
-#### 12.2 WebSocket技术实现方案
-
-**问题**: 选择合适的WebSocket实现技术，平衡性能、开发效率和维护成本。
-
-**详细方案对比**:
-
-##### 方案1: Spring WebSocket + STOMP
+**Spring WebSocket + STOMP完整配置**：
 ```java
 /**
- * Spring WebSocket配置
+ * Spring WebSocket + STOMP配置（详细版）
  */
 @Configuration
 @EnableWebSocketMessageBroker
-public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
-    
+@Slf4j
+public class StompWebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
     @Override
     public void configureMessageBroker(MessageBrokerRegistry config) {
-        config.enableSimpleBroker("/topic", "/queue");
+        // 方案1: SimpleBroker（基于内存，不支持集群）
+        config.enableSimpleBroker("/topic", "/queue")
+              .setHeartbeatValue(new long[]{10000, 20000}); // 心跳配置
+        
+        // 方案2: StompBrokerRelay（需要外部消息代理）
+        // config.enableStompBrokerRelay("/topic", "/queue")
+        //       .setRelayHost("localhost")
+        //       .setRelayPort(61613)
+        //       .setClientLogin("guest")
+        //       .setClientPasscode("guest");
+        
         config.setApplicationDestinationPrefixes("/app");
         config.setUserDestinationPrefix("/user");
     }
-    
+
     @Override
     public void registerStompEndpoints(StompEndpointRegistry registry) {
         registry.addEndpoint("/ws/im")
                 .setAllowedOriginPatterns("*")
+                .addInterceptors(new WebSocketAuthInterceptor())
+                .withSockJS()
+                .setSessionCookieNeeded(false);
+    }
+    
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(new ChannelInterceptor() {
+            @Override
+            public Message<?> preSend(Message<?> message, MessageChannel channel) {
+                StompHeaderAccessor accessor = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+                if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+                    // 连接认证逻辑
+                    String token = accessor.getFirstNativeHeader("Authorization");
+                    if (!validateToken(token)) {
+                        throw new IllegalArgumentException("Invalid token");
+                    }
+                }
+                return message;
+            }
+        });
+    }
+}
+```
+
+**STOMP消息处理器**：
+```java
+/**
+ * STOMP消息处理控制器
+ */
+@Controller
+@Slf4j
+public class StompMessageController {
+    
+    @Autowired
+    private SimpMessagingTemplate messagingTemplate;
+    
+    /**
+     * 处理客户端发送的私聊消息
+     * 客户端发送到: /app/private.send
+     */
+    @MessageMapping("/private.send")
+    public void handlePrivateMessage(@Payload PrivateMessageRequest request, 
+                                   SimpMessageHeaderAccessor headerAccessor) {
+        String senderId = headerAccessor.getUser().getName();
+        
+        // 业务处理
+        MessageDTO message = messageService.sendPrivateMessage(senderId, request);
+        
+        // 推送给接收者
+        messagingTemplate.convertAndSendToUser(
+            request.getReceiverId(),
+            "/queue/messages",
+            message
+        );
+        
+        // 推送给发送者（确认）
+        messagingTemplate.convertAndSendToUser(
+            senderId,
+            "/queue/messages",
+            message
+        );
+    }
+    
+    /**
+     * 处理群聊消息
+     * 客户端发送到: /app/group.send
+     */
+    @MessageMapping("/group.send")
+    public void handleGroupMessage(@Payload GroupMessageRequest request,
+                                 SimpMessageHeaderAccessor headerAccessor) {
+        String senderId = headerAccessor.getUser().getName();
+        
+        // 业务处理
+        MessageDTO message = messageService.sendGroupMessage(senderId, request);
+        
+        // 广播给群成员
+        messagingTemplate.convertAndSend(
+            "/topic/group/" + request.getConversationId(),
+            message
+        );
+    }
+}
+```
+
+##### STOMP方案的致命问题
+
+| 问题类型 | 具体问题 | 影响 | 解决难度 |
+|---------|----------|------|----------|
+| **SimpleBroker内存限制** | 基于内存存储订阅信息，重启丢失，不支持集群 | 致命 | 需要外部消息代理 |
+| **StompBrokerRelay复杂性** | 需要额外部署RabbitMQ/ActiveMQ | 高 | 增加运维复杂度 |
+| **性能瓶颈** | 每个连接占用一个线程 | 高 | 无法解决 |
+| **协议开销** | STOMP文本协议，消息体积大 | 中 | 无法优化 |
+| **扩展限制** | 难以自定义连接管理和消息路由 | 中 | 架构限制 |
+
+#### 12.2 抛弃STOMP的原生WebSocket方案（推荐）
+
+##### 原生WebSocket + RocketMQ架构
+```mermaid
+graph TD
+    subgraph "客户端层"
+        C1[Web客户端]
+        C2[移动客户端]
+    end
+    
+    subgraph "WebSocket层"
+        WS1[WebSocket服务1]
+        WS2[WebSocket服务2]
+        WS3[WebSocket服务N]
+    end
+    
+    subgraph "消息层"
+        MQ[RocketMQ集群]
+    end
+    
+    subgraph "存储层"
+        Redis[Redis集群<br>连接状态]
+        MySQL[MySQL<br>消息存储]
+    end
+    
+    C1 --> WS1
+    C2 --> WS2
+    
+    WS1 --> MQ
+    WS2 --> MQ
+    WS3 --> MQ
+    
+    MQ --> WS1
+    MQ --> WS2
+    MQ --> WS3
+    
+    WS1 --> Redis
+    WS2 --> Redis
+    WS3 --> Redis
+    
+    MQ --> MySQL
+```
+
+##### 原生WebSocket配置
+```java
+/**
+ * 原生WebSocket配置（无STOMP）
+ */
+@Configuration
+@EnableWebSocket
+@Slf4j
+public class NativeWebSocketConfig implements WebSocketConfigurer {
+
+    @Autowired
+    private WebSocketAuthInterceptor authInterceptor;
+    
+    @Autowired
+    private IMWebSocketHandler webSocketHandler;
+
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(webSocketHandler, "/ws/im")
+                .addInterceptors(authInterceptor)
+                .setAllowedOrigins("*")
                 .withSockJS();
     }
 }
 ```
 
-**优点**:
-- 与Spring Boot无缝集成
-- STOMP协议标准化，客户端支持好
-- 开发效率高，学习成本低
-- 内置SockJS降级支持
-- 支持集群部署（通过消息代理）
-
-**缺点**:
-- 性能相对较低
-- 内存占用较大
-- 连接数限制相对较低（约1-2万）
-- 定制化能力有限
-
-**适用场景**: 中小规模应用，快速开发
-
-##### 方案2: Netty + 自定义协议
+##### WebSocket处理器实现
 ```java
 /**
- * Netty WebSocket服务器
+ * 原生WebSocket处理器
  */
 @Component
-public class NettyWebSocketServer {
+@Slf4j
+public class IMWebSocketHandler extends TextWebSocketHandler {
     
-    private EventLoopGroup bossGroup;
-    private EventLoopGroup workerGroup;
+    @Autowired
+    private WebSocketSessionManager sessionManager;
     
-    public void start() throws InterruptedException {
-        bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup();
-        
-        ServerBootstrap bootstrap = new ServerBootstrap();
-        bootstrap.group(bossGroup, workerGroup)
-                .channel(NioServerSocketChannel.class)
-                .childHandler(new WebSocketChannelInitializer());
-    }
-}
-```
-
-**优点**:
-- 性能极高，支持10万+并发连接
-- 内存使用效率高
-- 完全可定制化
-- 支持各种协议扩展
-- 适合大规模部署
-
-**缺点**:
-- 开发复杂度高
-- 学习成本大
-- 需要处理更多底层细节
-- 调试和维护困难
-- 与Spring集成需要额外工作
-
-**适用场景**: 大规模应用，性能要求极高
-
-##### 方案3: Spring WebFlux + Reactive WebSocket
-```java
-/**
- * WebFlux WebSocket配置
- */
-@Configuration
-public class WebFluxWebSocketConfig {
+    @Autowired
+    private RocketMQMessageProducer messageProducer;
     
-    @Bean
-    public HandlerMapping webSocketMapping() {
-        Map<String, WebSocketHandler> map = new HashMap<>();
-        map.put("/ws/im", new IMWebSocketHandler());
-        
-        SimpleUrlHandlerMapping mapping = new SimpleUrlHandlerMapping();
-        mapping.setUrlMap(map);
-        mapping.setOrder(1);
-        return mapping;
-    }
-}
-```
+    @Autowired
+    private MessageService messageService;
 
-**优点**:
-- 响应式编程模型
-- 更好的资源利用率
-- 支持背压处理
-- 与Spring生态集成好
-- 适合高并发场景
-
-**缺点**:
-- 学习曲线陡峭
-- 调试复杂
-- 生态相对不成熟
-- 开发效率相对较低
-
-**适用场景**: 高并发，响应式架构
-
-##### 方案4: 混合架构（推荐）
-```java
-/**
- * 混合架构设计
- */
-public class HybridWebSocketArchitecture {
-    
-    // 阶段1: Spring WebSocket快速上线
-    @ConditionalOnProperty(name = "websocket.mode", havingValue = "spring")
-    @Configuration
-    static class SpringWebSocketConfig {
-        // Spring WebSocket配置
-    }
-    
-    // 阶段2: Netty高性能升级
-    @ConditionalOnProperty(name = "websocket.mode", havingValue = "netty")
-    @Configuration
-    static class NettyWebSocketConfig {
-        // Netty配置
-    }
-}
-```
-
-**优点**:
-- 渐进式演进，风险可控
-- 初期快速上线，后期性能优化
-- 技术栈平滑过渡
-- 支持A/B测试
-
-**缺点**:
-- 需要维护两套代码
-- 架构复杂度增加
-
-**选择方案**: **混合架构（Spring WebSocket → Netty）**
-- 初期使用Spring WebSocket快速上线
-- 后期根据性能需求升级到Netty
-- 平衡开发效率和性能要求
-
-#### 12.3 多客户端连接优化方案
-
-**问题**: 同一用户在多个客户端（Web、移动端、桌面端）同时在线时的连接管理。
-
-**方案设计**:
-
-##### 连接复用策略
-```java
-/**
- * 用户连接管理器
- */
-@Service
-public class UserConnectionManager {
-    
-    // 用户多连接映射 userId -> List<ConnectionInfo>
-    private final Map<String, List<ConnectionInfo>> userConnections = new ConcurrentHashMap<>();
-    
     /**
-     * 用户连接信息
+     * 连接建立
      */
-    public static class ConnectionInfo {
-        private String connectionId;     // 连接唯一标识
-        private String deviceType;      // 设备类型：web/mobile/desktop
-        private String deviceId;        // 设备唯一标识
-        private Long lastActiveTime;    // 最后活跃时间
-        private WebSocketSession session; // WebSocket会话
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        String userId = getUserId(session);
+        if (userId != null) {
+            sessionManager.addSession(userId, session);
+            log.info("用户{}连接成功, sessionId: {}", userId, session.getId());
+            
+            // 发送用户上线事件到MQ
+            UserOnlineEvent event = new UserOnlineEvent(userId, getServerId());
+            messageProducer.sendMessage("USER_ONLINE", event);
+            
+            // 推送离线消息
+            pushOfflineMessages(userId);
+        }
     }
-    
+
     /**
-     * 智能消息推送
+     * 接收消息
      */
-    public void pushMessage(String userId, MessageDTO message) {
-        List<ConnectionInfo> connections = userConnections.get(userId);
-        if (connections == null || connections.isEmpty()) {
-            // 用户离线，存储离线消息
-            offlineMessageService.store(userId, message);
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+        String userId = getUserId(session);
+        if (userId == null) {
             return;
         }
-        
-        // 根据消息类型和设备特性选择推送策略
-        if (message.isUrgent()) {
-            // 紧急消息推送到所有设备
-            connections.forEach(conn -> sendToConnection(conn, message));
-        } else {
-            // 普通消息推送到最活跃设备
-            ConnectionInfo activeConnection = findMostActiveConnection(connections);
-            sendToConnection(activeConnection, message);
+
+        try {
+            // 解析消息
+            WebSocketMessageRequest request = JsonUtil.parseObject(message.getPayload(), WebSocketMessageRequest.class);
+            
+            switch (request.getType()) {
+                case "SEND_PRIVATE_MESSAGE":
+                    handlePrivateMessage(userId, request);
+                    break;
+                case "SEND_GROUP_MESSAGE":
+                    handleGroupMessage(userId, request);
+                    break;
+                case "HEARTBEAT":
+                    handleHeartbeat(session);
+                    break;
+                default:
+                    log.warn("未知消息类型: {}", request.getType());
+            }
+        } catch (Exception e) {
+            log.error("处理WebSocket消息失败", e);
+            sendErrorMessage(session, "消息处理失败");
+        }
+    }
+
+    /**
+     * 连接关闭
+     */
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+        String userId = getUserId(session);
+        if (userId != null) {
+            sessionManager.removeSession(userId, session.getId());
+            log.info("用户{}断开连接, sessionId: {}", userId, session.getId());
+            
+            // 发送用户下线事件到MQ
+            UserOfflineEvent event = new UserOfflineEvent(userId, getServerId());
+            messageProducer.sendMessage("USER_OFFLINE", event);
+        }
+    }
+
+    /**
+     * 连接异常
+     */
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable exception) throws Exception {
+        log.error("WebSocket连接异常", exception);
+        session.close();
+    }
+
+    /**
+     * 处理私聊消息
+     */
+    private void handlePrivateMessage(String senderId, WebSocketMessageRequest request) {
+        try {
+            // 业务处理：保存消息到数据库
+            MessageDTO message = messageService.sendPrivateMessage(senderId, request.getData());
+            
+            // 发送到MQ进行集群分发
+            PrivateMessageEvent event = new PrivateMessageEvent(
+                message.getReceiverId(),
+                message,
+                getServerId()
+            );
+            messageProducer.sendMessage("PRIVATE_MESSAGE", event);
+            
+            log.info("私聊消息发送成功: {}", message.getMessageId());
+            
+        } catch (Exception e) {
+            log.error("处理私聊消息失败", e);
+        }
+    }
+
+    /**
+     * 处理群聊消息
+     */
+    private void handleGroupMessage(String senderId, WebSocketMessageRequest request) {
+        try {
+            // 业务处理：保存消息到数据库
+            MessageDTO message = messageService.sendGroupMessage(senderId, request.getData());
+            
+            // 获取群成员列表
+            List<String> memberIds = conversationService.getMemberIds(message.getConversationId());
+            
+            // 发送到MQ进行集群分发
+            GroupMessageEvent event = new GroupMessageEvent(
+                message.getConversationId(),
+                memberIds,
+                message,
+                getServerId()
+            );
+            messageProducer.sendMessage("GROUP_MESSAGE", event);
+            
+            log.info("群聊消息发送成功: {}", message.getMessageId());
+            
+        } catch (Exception e) {
+            log.error("处理群聊消息失败", e);
         }
     }
 }
 ```
 
-##### 连接去重策略
+##### WebSocket会话管理器
 ```java
 /**
- * 连接去重配置
- */
-@ConfigurationProperties(prefix = "websocket.connection")
-@Data
-public class ConnectionDeduplicationConfig {
-    
-    /**
-     * 同设备最大连接数
-     */
-    private int maxConnectionsPerDevice = 1;
-    
-    /**
-     * 同用户最大连接数
-     */
-    private int maxConnectionsPerUser = 5;
-    
-    /**
-     * 连接超时时间（秒）
-     */
-    private int connectionTimeoutSeconds = 300;
-    
-    /**
-     * 心跳间隔（秒）
-     */
-    private int heartbeatIntervalSeconds = 30;
-}
-```
-
-#### 12.4 大规模连接数优化方案
-
-**问题**: 当用户量增长到10万+时，如何保证服务端连接数不过多占用资源。
-
-**优化策略**:
-
-##### 分层连接管理
-```mermaid
-graph TD
-    subgraph "连接分层架构"
-        L1[一级连接池<br>活跃用户<br>1万连接]
-        L2[二级连接池<br>普通用户<br>5万连接]
-        L3[三级连接池<br>低活跃用户<br>长连接保持]
-    end
-    
-    subgraph "连接策略"
-        S1[实时连接<br>高频交互用户]
-        S2[准实时连接<br>中频交互用户]
-        S3[轮询连接<br>低频交互用户]
-    end
-    
-    L1 --> S1
-    L2 --> S2
-    L3 --> S3
-```
-
-##### 连接池配置优化
-```java
-/**
- * 连接池优化配置
- */
-@Configuration
-public class WebSocketOptimizationConfig {
-    
-    /**
-     * Netty连接池配置
-     */
-    @Bean
-    public NettyChannelPoolConfig channelPoolConfig() {
-        return NettyChannelPoolConfig.builder()
-                .maxConnections(100000)           // 最大连接数
-                .maxPendingAcquires(10000)        // 最大等待连接数
-                .acquireTimeoutMillis(5000)       // 连接获取超时
-                .maxIdleTime(Duration.ofMinutes(10)) // 最大空闲时间
-                .healthCheckInterval(Duration.ofSeconds(30)) // 健康检查间隔
-                .build();
-    }
-    
-    /**
-     * JVM优化参数
-     */
-    @PostConstruct
-    public void optimizeJVM() {
-        // 设置JVM参数
-        System.setProperty("io.netty.allocator.maxOrder", "9");
-        System.setProperty("io.netty.allocator.numDirectArenas", "2");
-        System.setProperty("io.netty.allocator.numHeapArenas", "2");
-    }
-}
-```
-
-##### 智能降级策略
-```java
-/**
- * 连接降级策略
+ * WebSocket会话管理器
  */
 @Component
-public class ConnectionDegradationStrategy {
-    
-    private final AtomicInteger currentConnections = new AtomicInteger(0);
-    private final int maxConnections = 80000; // 最大连接数阈值
-    
-    /**
-     * 连接准入控制
-     */
-    public boolean allowNewConnection(String userId, String deviceType) {
-        int current = currentConnections.get();
-        
-        if (current >= maxConnections) {
-            // 达到最大连接数，执行降级策略
-            return executeDegradationStrategy(userId, deviceType);
-        }
-        
-        return true;
-    }
-    
-    private boolean executeDegradationStrategy(String userId, String deviceType) {
-        // 策略1: 踢出最久未活跃的连接
-        ConnectionInfo oldestInactive = findOldestInactiveConnection();
-        if (oldestInactive != null) {
-            closeConnection(oldestInactive);
-            return true;
-        }
-        
-        // 策略2: 限制低优先级设备连接
-        if ("desktop".equals(deviceType)) {
-            return false; // 拒绝桌面端连接
-        }
-        
-        // 策略3: VIP用户优先
-        if (isVipUser(userId)) {
-            ConnectionInfo normalUserConnection = findNormalUserConnection();
-            if (normalUserConnection != null) {
-                closeConnection(normalUserConnection);
-                return true;
-            }
-        }
-        
-        return false;
-    }
-}
-```
-
-#### 12.5 消息路由架构
-
-**选择方案**: **消息队列路由 + 异步处理**
-
-```mermaid
-graph TD
-    subgraph "消息发送流程"
-        A[消息发送] --> B[消息验证]
-        B --> C[存储到数据库]
-        C --> D[发送到MQ]
-    end
-    
-    subgraph "消息路由处理"
-        D --> E[单聊队列]
-        D --> F[群聊队列]
-        D --> G[系统通知队列]
-    end
-    
-    subgraph "消息推送"
-        E --> H[在线用户推送]
-        F --> I[群成员推送]
-        G --> J[系统广播]
-        
-        H --> K[离线消息存储]
-        I --> K
-        J --> K
-    end
-```
-
-#### 12.6 会话状态管理
-
-**选择方案**: **Redis集中式状态管理**
-
-```java
-/**
- * 会话状态管理
- */
-@Service
-public class ConversationStateManager {
+@Slf4j
+public class WebSocketSessionManager {
     
     @Autowired
     private RedisTemplate<String, Object> redisTemplate;
     
-    private static final String USER_ONLINE_KEY = "user:online:";
-    private static final String CONVERSATION_MEMBERS_KEY = "conversation:members:";
-    private static final String USER_CONVERSATIONS_KEY = "user:conversations:";
+    // 本地会话缓存 userId -> List<WebSocketSession>
+    private final Map<String, List<WebSocketSession>> localSessions = new ConcurrentHashMap<>();
     
+    private static final String USER_SESSIONS_KEY = "ws:sessions:";
+    private static final String SERVER_SESSIONS_KEY = "ws:server:sessions:";
+
     /**
-     * 用户上线
+     * 添加会话
      */
-    public void userOnline(String userId, String connectionId) {
-        String key = USER_ONLINE_KEY + userId;
-        redisTemplate.opsForHash().put(key, "connectionId", connectionId);
-        redisTemplate.opsForHash().put(key, "onlineTime", System.currentTimeMillis());
-        redisTemplate.expire(key, Duration.ofHours(24));
-    }
-    
-    /**
-     * 获取会话在线成员
-     */
-    public List<String> getOnlineMembers(String conversationId) {
-        String key = CONVERSATION_MEMBERS_KEY + conversationId;
-        Set<String> members = redisTemplate.opsForSet().members(key);
+    public void addSession(String userId, WebSocketSession session) {
+        // 本地缓存
+        localSessions.computeIfAbsent(userId, k -> new ArrayList<>()).add(session);
         
-        return members.stream()
-                .filter(this::isUserOnline)
-                .collect(Collectors.toList());
+        // Redis记录（用于集群间查找用户所在服务器）
+        String sessionKey = USER_SESSIONS_KEY + userId;
+        String serverSessionKey = SERVER_SESSIONS_KEY + getServerId();
+        
+        Map<String, Object> sessionInfo = new HashMap<>();
+        sessionInfo.put("sessionId", session.getId());
+        sessionInfo.put("serverId", getServerId());
+        sessionInfo.put("connectTime", System.currentTimeMillis());
+        
+        redisTemplate.opsForHash().put(sessionKey, session.getId(), sessionInfo);
+        redisTemplate.opsForSet().add(serverSessionKey, userId);
+        redisTemplate.expire(sessionKey, Duration.ofHours(24));
+        redisTemplate.expire(serverSessionKey, Duration.ofHours(24));
+    }
+
+    /**
+     * 移除会话
+     */
+    public void removeSession(String userId, String sessionId) {
+        // 本地缓存
+        List<WebSocketSession> sessions = localSessions.get(userId);
+        if (sessions != null) {
+            sessions.removeIf(session -> sessionId.equals(session.getId()));
+            if (sessions.isEmpty()) {
+                localSessions.remove(userId);
+            }
+        }
+        
+        // Redis清理
+        String sessionKey = USER_SESSIONS_KEY + userId;
+        String serverSessionKey = SERVER_SESSIONS_KEY + getServerId();
+        
+        redisTemplate.opsForHash().delete(sessionKey, sessionId);
+        if (redisTemplate.opsForHash().size(sessionKey) == 0) {
+            redisTemplate.delete(sessionKey);
+            redisTemplate.opsForSet().remove(serverSessionKey, userId);
+        }
+    }
+
+    /**
+     * 向本地用户发送消息
+     */
+    public boolean sendToLocalUser(String userId, Object message) {
+        List<WebSocketSession> sessions = localSessions.get(userId);
+        if (sessions == null || sessions.isEmpty()) {
+            return false;
+        }
+
+        String messageText = JsonUtil.toJsonString(message);
+        boolean sent = false;
+        
+        Iterator<WebSocketSession> iterator = sessions.iterator();
+        while (iterator.hasNext()) {
+            WebSocketSession session = iterator.next();
+            if (session.isOpen()) {
+                try {
+                    session.sendMessage(new TextMessage(messageText));
+                    sent = true;
+                } catch (Exception e) {
+                    log.error("发送消息失败", e);
+                }
+            } else {
+                iterator.remove();
+            }
+        }
+        
+        return sent;
+    }
+
+    /**
+     * 检查用户是否在当前服务器在线
+     */
+    public boolean isUserOnlineLocally(String userId) {
+        List<WebSocketSession> sessions = localSessions.get(userId);
+        return sessions != null && !sessions.isEmpty();
+    }
+
+    /**
+     * 获取当前服务器在线用户数
+     */
+    public int getLocalUserCount() {
+        return localSessions.size();
+    }
+
+    /**
+     * 获取当前服务器总连接数
+     */
+    public int getLocalConnectionCount() {
+        return localSessions.values().stream().mapToInt(List::size).sum();
     }
 }
 ```
 
-#### 12.7 消息持久化架构
+#### 12.3 基于RocketMQ的集群消息分发
 
-**选择方案**: **渐进式演进（单表→时间分片）**
-
-**阶段1: 单表存储**
-```sql
--- 扩展现有消息表
-ALTER TABLE t_msg_body ADD COLUMN conversation_id VARCHAR(50);
-ALTER TABLE t_msg_body ADD COLUMN message_format INT DEFAULT 0;
-ALTER TABLE t_msg_body ADD INDEX idx_conversation_time (conversation_id, create_time);
+##### RocketMQ消息生产者
+```java
+/**
+ * RocketMQ消息生产者
+ */
+@Service
+@Slf4j
+public class RocketMQMessageProducer {
+    
+    @Autowired
+    private RocketMQTemplate rocketMQTemplate;
+    
+    private static final String TOPIC_IM_MESSAGE = "IM_MESSAGE_TOPIC";
+    
+    /**
+     * 发送私聊消息事件
+     */
+    public void sendPrivateMessageEvent(PrivateMessageEvent event) {
+        try {
+            Message<PrivateMessageEvent> message = MessageBuilder
+                    .withPayload(event)
+                    .setHeader(MessageConst.PROPERTY_KEYS, event.getReceiverId())
+                    .setHeader(MessageConst.PROPERTY_TAGS, "PRIVATE_MESSAGE")
+                    .build();
+            
+            rocketMQTemplate.asyncSend(TOPIC_IM_MESSAGE, message, new SendCallback() {
+                @Override
+                public void onSuccess(SendResult sendResult) {
+                    log.debug("私聊消息事件发送成功: {}", event.getMessageId());
+                }
+                
+                @Override
+                public void onException(Throwable e) {
+                    log.error("私聊消息事件发送失败: {}", event.getMessageId(), e);
+                }
+            });
+        } catch (Exception e) {
+            log.error("发送私聊消息事件异常", e);
+        }
+    }
+    
+    /**
+     * 发送群聊消息事件
+     */
+    public void sendGroupMessageEvent(GroupMessageEvent event) {
+        try {
+            Message<GroupMessageEvent> message = MessageBuilder
+                    .withPayload(event)
+                    .setHeader(MessageConst.PROPERTY_KEYS, event.getConversationId())
+                    .setHeader(MessageConst.PROPERTY_TAGS, "GROUP_MESSAGE")
+                    .build();
+            
+            rocketMQTemplate.asyncSend(TOPIC_IM_MESSAGE, message, new SendCallback() {
+                @Override
+                public void onSuccess(SendResult sendResult) {
+                    log.debug("群聊消息事件发送成功: {}", event.getMessageId());
+                }
+                
+                @Override
+                public void onException(Throwable e) {
+                    log.error("群聊消息事件发送失败: {}", event.getMessageId(), e);
+                }
+            });
+        } catch (Exception e) {
+            log.error("发送群聊消息事件异常", e);
+        }
+    }
+}
 ```
 
-**阶段2: 时间分片**
-```sql
--- 按月分表
-CREATE TABLE t_msg_body_202401 LIKE t_msg_body;
-CREATE TABLE t_msg_body_202402 LIKE t_msg_body;
--- 自动分表逻辑
+##### RocketMQ消息消费者
+```java
+/**
+ * RocketMQ消息消费者
+ */
+@Component
+@Slf4j
+public class RocketMQMessageConsumer {
+    
+    @Autowired
+    private WebSocketSessionManager sessionManager;
+    
+    @Autowired
+    private OfflineMessageService offlineMessageService;
+    
+    /**
+     * 消费私聊消息事件
+     */
+    @RocketMQMessageListener(
+        topic = "IM_MESSAGE_TOPIC",
+        selectorExpression = "PRIVATE_MESSAGE",
+        consumerGroup = "im-private-message-consumer"
+    )
+    public void consumePrivateMessage(PrivateMessageEvent event) {
+        try {
+            String receiverId = event.getReceiverId();
+            MessageDTO message = event.getMessage();
+            
+            // 检查接收者是否在当前服务器在线
+            if (sessionManager.isUserOnlineLocally(receiverId)) {
+                // 在线，直接推送
+                WebSocketMessageResponse response = WebSocketMessageResponse.builder()
+                        .type("NEW_MESSAGE")
+                        .data(message)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+                
+                boolean sent = sessionManager.sendToLocalUser(receiverId, response);
+                if (sent) {
+                    log.info("私聊消息推送成功: receiverId={}, messageId={}", receiverId, message.getMessageId());
+                } else {
+                    log.warn("私聊消息推送失败，用户可能刚离线: receiverId={}", receiverId);
+                    offlineMessageService.store(receiverId, message);
+                }
+            } else {
+                // 不在当前服务器，忽略（其他服务器会处理）
+                log.debug("用户{}不在当前服务器，忽略消息: {}", receiverId, message.getMessageId());
+            }
+        } catch (Exception e) {
+            log.error("处理私聊消息事件失败", e);
+        }
+    }
+    
+    /**
+     * 消费群聊消息事件
+     */
+    @RocketMQMessageListener(
+        topic = "IM_MESSAGE_TOPIC", 
+        selectorExpression = "GROUP_MESSAGE",
+        consumerGroup = "im-group-message-consumer"
+    )
+    public void consumeGroupMessage(GroupMessageEvent event) {
+        try {
+            List<String> memberIds = event.getMemberIds();
+            MessageDTO message = event.getMessage();
+            
+            WebSocketMessageResponse response = WebSocketMessageResponse.builder()
+                    .type("NEW_MESSAGE")
+                    .data(message)
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+            
+            int onlineCount = 0;
+            int offlineCount = 0;
+            
+            // 遍历群成员，推送给在当前服务器在线的用户
+            for (String memberId : memberIds) {
+                if (sessionManager.isUserOnlineLocally(memberId)) {
+                    boolean sent = sessionManager.sendToLocalUser(memberId, response);
+                    if (sent) {
+                        onlineCount++;
+                    } else {
+                        offlineMessageService.store(memberId, message);
+                        offlineCount++;
+                    }
+                }
+            }
+            
+            log.info("群聊消息推送完成: conversationId={}, messageId={}, 在线={}人, 离线={}人", 
+                    event.getConversationId(), message.getMessageId(), onlineCount, offlineCount);
+                    
+        } catch (Exception e) {
+            log.error("处理群聊消息事件失败", e);
+        }
+    }
+}
 ```
 
-### 技术栈选择
+#### 12.4 性能对比与升级路径
 
-| 技术分类 | 选型 | 版本 | 说明 |
-|---------|------|------|------|
-| Web框架 | Spring Boot | 2.3.12 | 与现有项目保持一致 |
-| WebSocket | Spring WebSocket → Netty | - | 渐进式升级 |
-| 消息队列 | RocketMQ | 4.9.x | 现有技术栈 |
-| 缓存 | Redis | 6.x | 状态管理、会话缓存 |
-| 数据库 | MySQL | 8.0 | 兼容现有数据库 |
-| 连接池 | HikariCP | 3.4.x | 高性能连接池 |
+##### 性能对比表
 
-### 性能指标目标
+| 方案 | 并发连接数 | 集群支持 | 开发复杂度 | 扩展性 | 推荐度 |
+|------|----------|----------|------------|--------|--------|
+| Spring WebSocket + STOMP + SimpleBroker | 1-2万 | ❌ 不支持 | 低 | 差 | ⭐⭐ |
+| Spring WebSocket + STOMP + StompBrokerRelay | 1-2万 | ✅ 支持 | 中 | 中 | ⭐⭐⭐ |
+| **原生WebSocket + RocketMQ** | **2-3万** | **✅ 支持** | **中** | **好** | **⭐⭐⭐⭐⭐** |
+| Netty + 自定义协议 + RocketMQ | 10万+ | ✅ 支持 | 高 | 优秀 | ⭐⭐⭐⭐ |
 
-| 指标 | 目标值 | 说明 |
-|------|--------|------|
-| 并发连接数 | 10万+ | 支持大规模用户同时在线 |
-| 消息延迟 | <100ms | 消息发送到接收的延迟 |
-| 消息吞吐量 | 10万条/秒 | 系统消息处理能力 |
-| 可用性 | 99.9% | 系统稳定性要求 |
-| 响应时间 | <200ms | API接口响应时间 |
+##### 向Netty升级路径
+```mermaid
+graph TD
+    A[阶段1: 原生WebSocket + RocketMQ] --> B{性能评估}
+    B -->|连接数<3万| C[优化现有方案]
+    B -->|连接数>3万| D[阶段2: Netty升级]
+    
+    C --> E[连接池优化<br>内存调优<br>负载均衡优化]
+    
+    D --> F[Netty WebSocket实现]
+    F --> G[保持RocketMQ消息分发不变]
+    G --> H[逐步迁移用户连接]
+    H --> I[完成升级]
+    
+    style A fill:#e1f5fe
+    style F fill:#f3e5f5
+    style G fill:#e8f5e8
+```
+
+**Netty升级要点**：
+1. **保持消息分发层不变**：继续使用RocketMQ，只替换WebSocket实现
+2. **渐进式迁移**：通过负载均衡逐步切换流量
+3. **接口兼容性**：客户端无需修改，保持相同的消息格式
+
+### 最终推荐方案
+
+**选择**：**原生WebSocket + RocketMQ**
+
+**核心优势**：
+1. **利用现有技术栈**：直接使用RocketMQ，无需额外部署
+2. **真正的集群支持**：通过RocketMQ实现消息分发
+3. **性能提升**：抛弃STOMP协议开销，支持2-3万并发
+4. **扩展性好**：可平滑升级到Netty，消息分发层无需改动
+5. **开发成本适中**：比STOMP复杂一些，但比Netty简单很多
+
+**技术栈**：
+- WebSocket：Spring WebSocket（原生，非STOMP）
+- 消息分发：RocketMQ
+- 连接管理：Redis
+- 数据存储：MySQL
 
 ## 13. 接口定义
 
