@@ -35,25 +35,294 @@ CONVERSATION(0, "会话"), // 兼容字段，relatingBizType为会话时使用
 ```
 
 ## 3. 用例图
-### 聊天模式用例
-1. **单聊场景**
-   - 用户发起单聊
-   - 发送文本/图片/文件消息
-   - 消息状态管理（发送中、已送达、已读）
-   - 撤回消息
-   - 转发消息
 
-2. **群聊场景**
-   - 创建群聊
-   - 邀请/移除成员
-   - 群管理（群主、管理员权限）
-   - 群公告管理
-   - 退出群聊
+### 3.1 IM功能整体用例图
+```mermaid
+graph TB
+    subgraph "用户角色"
+        User[普通用户]
+        Admin[管理员]
+        System[系统]
+    end
+    
+    subgraph "单聊功能"
+        UC1[发起单聊]
+        UC2[发送消息]
+        UC3[接收消息]
+        UC4[撤回消息]
+        UC5[转发消息]
+        UC6[标记已读]
+    end
+    
+    subgraph "群聊功能"
+        UC7[创建群聊]
+        UC8[邀请成员]
+        UC9[移除成员]
+        UC10[群聊管理]
+        UC11[退出群聊]
+        UC12[解散群聊]
+    end
+    
+    subgraph "会话管理"
+        UC13[查看会话列表]
+        UC14[会话置顶]
+        UC15[会话静音]
+        UC16[会话归档]
+        UC17[删除会话]
+    end
+    
+    subgraph "系统通知"
+        UC18[业务审核通知]
+        UC19[订单状态通知]
+        UC20[系统公告]
+        UC21[平台客服]
+    end
+    
+    User --> UC1
+    User --> UC2
+    User --> UC3
+    User --> UC4
+    User --> UC5
+    User --> UC6
+    User --> UC7
+    User --> UC8
+    User --> UC9
+    User --> UC10
+    User --> UC11
+    User --> UC13
+    User --> UC14
+    User --> UC15
+    User --> UC16
+    User --> UC17
+    User --> UC21
+    
+    Admin --> UC12
+    Admin --> UC18
+    Admin --> UC19
+    Admin --> UC20
+    
+    System --> UC18
+    System --> UC19
+    System --> UC20
+```
 
-3. **系统通知场景**
-   - 业务审核通知
-   - 订单状态通知
-   - 系统公告推送
+### 3.2 核心用例详细描述
+
+#### 3.2.1 单聊消息发送用例
+```mermaid
+graph TD
+    A[用户A] --> B[选择联系人B]
+    B --> C{会话是否存在?}
+    C -->|否| D[创建单聊会话]
+    C -->|是| E[进入现有会话]
+    D --> E
+    E --> F[输入消息内容]
+    F --> G[选择消息类型]
+    G --> H{消息格式验证}
+    H -->|失败| I[显示错误提示]
+    H -->|成功| J[发送消息]
+    J --> K[保存到数据库]
+    K --> L[推送给用户B]
+    L --> M{用户B在线?}
+    M -->|是| N[实时推送]
+    M -->|否| O[存储离线消息]
+    N --> P[显示已送达]
+    O --> P
+    I --> F
+```
+
+#### 3.2.2 群聊创建用例
+```mermaid
+graph TD
+    A[群主] --> B[点击创建群聊]
+    B --> C[输入群名称]
+    C --> D[选择群成员]
+    D --> E{成员数量验证}
+    E -->|超限| F[显示数量限制错误]
+    E -->|正常| G[设置群头像]
+    G --> H[确认创建]
+    H --> I[生成群聊会话]
+    I --> J[批量添加成员]
+    J --> K[发送群创建通知]
+    K --> L[推送给所有成员]
+    L --> M[群聊创建成功]
+    F --> D
+```
+
+#### 3.2.3 WebSocket连接建立用例
+```mermaid
+graph TD
+    A[用户打开聊天页面] --> B[发起WebSocket连接]
+    B --> C[API网关认证]
+    C --> D{Token验证}
+    D -->|失败| E[返回认证失败]
+    D -->|成功| F[负载均衡分发]
+    F --> G[WebSocket服务器]
+    G --> H[握手验证]
+    H --> I{连接数检查}
+    I -->|超限| J[拒绝连接]
+    I -->|正常| K[建立连接]
+    K --> L[注册用户状态]
+    L --> M[推送离线消息]
+    M --> N[连接建立成功]
+    E --> O[显示登录页面]
+    J --> P[显示连接失败]
+```
+
+### 3.3 技术方案关键决策用例
+
+#### 3.3.1 消息路由决策用例
+```mermaid
+graph TD
+    A[消息发送请求] --> B{接收方在线?}
+    B -->|否| C[存储离线消息]
+    B -->|是| D[查询接收方服务器]
+    D --> E{在当前服务器?}
+    E -->|是| F[直接推送]
+    E -->|否| G[通过RocketMQ路由]
+    G --> H[目标服务器消费]
+    H --> I[推送给接收方]
+    F --> J[推送成功]
+    I --> J
+    C --> K[等待用户上线]
+```
+
+#### 3.3.2 集群扩展决策用例
+```mermaid
+graph TD
+    A[系统负载监控] --> B{连接数超阈值?}
+    B -->|否| C[继续监控]
+    B -->|是| D[触发扩展策略]
+    D --> E{扩展类型选择}
+    E -->|水平扩展| F[增加服务器实例]
+    E -->|垂直扩展| G[升级服务器配置]
+    E -->|智能降级| H[限制低优先级连接]
+    F --> I[负载重新分配]
+    G --> I
+    H --> J[保证核心用户体验]
+    I --> K[监控扩展效果]
+    J --> K
+    K --> C
+```
+
+#### 3.3.3 技术栈选型决策用例
+```mermaid
+graph TD
+    A[IM功能需求] --> B{性能要求评估}
+    B -->|中等| C[Spring WebSocket方案]
+    B -->|高| D[Netty方案]
+    B -->|极高| E[混合架构方案]
+    
+    C --> F[快速开发]
+    C --> G[易于维护]
+    C --> H[适合中小规模]
+    
+    D --> I[极致性能]
+    D --> J[复杂开发]
+    D --> K[适合大规模]
+    
+    E --> L[渐进式升级]
+    E --> M[平滑过渡]
+    E --> N[最佳实践]
+    
+    F --> O[技术选型确定]
+    G --> O
+    H --> O
+    I --> O
+    J --> O
+    K --> O
+    L --> O
+    M --> O
+    N --> O
+```
+
+### 3.4 异常处理用例
+
+#### 3.4.1 网络异常处理用例
+```mermaid
+graph TD
+    A[WebSocket连接] --> B[网络异常检测]
+    B --> C{异常类型}
+    C -->|连接断开| D[触发重连机制]
+    C -->|网络延迟| E[启用心跳检测]
+    C -->|服务器故障| F[切换服务器]
+    
+    D --> G[指数退避重连]
+    G --> H{重连成功?}
+    H -->|是| I[恢复正常通信]
+    H -->|否| J[显示离线状态]
+    
+    E --> K[调整心跳频率]
+    K --> L[监控连接质量]
+    
+    F --> M[负载均衡重分配]
+    M --> N[用户无感知切换]
+```
+
+#### 3.4.2 消息可靠性保证用例
+```mermaid
+graph TD
+    A[消息发送] --> B[本地存储]
+    B --> C[发送到服务器]
+    C --> D{发送成功?}
+    D -->|是| E[标记已发送]
+    D -->|否| F[重试机制]
+    F --> G{重试次数检查}
+    G -->|未超限| H[延迟重试]
+    G -->|超限| I[标记发送失败]
+    H --> C
+    E --> J[等待送达确认]
+    J --> K{收到确认?}
+    K -->|是| L[标记已送达]
+    K -->|否| M[超时重发]
+    M --> C
+    I --> N[用户手动重发]
+```
+
+### 3.5 业务扩展用例
+
+#### 3.5.1 多端同步用例
+```mermaid
+graph TD
+    A[用户多设备登录] --> B[设备连接管理]
+    B --> C{连接策略}
+    C -->|全部推送| D[所有设备接收消息]
+    C -->|智能推送| E[活跃设备优先]
+    C -->|单设备| F[踢出其他设备]
+    
+    D --> G[消息状态同步]
+    E --> H[设备活跃度检测]
+    F --> I[发送下线通知]
+    
+    G --> J[已读状态同步]
+    H --> K[动态调整推送策略]
+    I --> L[单设备体验]
+```
+
+#### 3.5.2 消息审核用例
+```mermaid
+graph TD
+    A[用户发送消息] --> B[内容预检查]
+    B --> C{敏感词检测}
+    C -->|通过| D[直接发送]
+    C -->|疑似| E[人工审核队列]
+    C -->|违规| F[拒绝发送]
+    
+    E --> G[审核员处理]
+    G --> H{审核结果}
+    H -->|通过| I[延迟发送]
+    H -->|拒绝| J[通知用户]
+    
+    D --> K[正常消息流程]
+    I --> K
+    F --> L[显示违规提示]
+    J --> L
+```
+
+**参考资料**：
+- [用例图设计最佳实践](https://www.visual-paradigm.com/guide/uml-unified-modeling-language/what-is-use-case-diagram/)
+- [IM系统用例分析](https://www.cnblogs.com/flashsun/p/14318928.html)
+- [WebSocket用例设计](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
 
 ## 4. 领域模型
 
@@ -121,6 +390,13 @@ CHECK (
 
 #### 扩展现有表
 1. **t_msg_body** - 新增IM相关字段
+
+### 会话设计原则
+- A和B单聊与B和A单聊是天然的同一个会话，不能存在多个，而A和B可以创建多个群
+- conversation_key，单聊：private_min(id1,id2)_max(id1,id2)，容易判断单聊会话是否存在，保证唯一性
+- A的会话列表，跟B的单聊会话看到的是B的logo，而A跟B的群聊会话，看到的是群logo
+- 单聊只能有两个成员，每个成员的未读数量直接记录在会话表上，而群聊每个成员的未读数量记录在群成员表上
+- 群聊有自己的特性（群管理、群接龙游戏等），单聊是不适合的
 
 ### 字段说明
 #### conversation_key字段
@@ -512,6 +788,755 @@ public class ConversationMemberDomainService {
 ```
 
 **详细实现请参考第7章"领域服务层"。**
+
+**参考资料**：
+- [DDD领域建模实践](https://www.cnblogs.com/daxnet/p/ddd-domain-modeling.html)
+- [领域事件设计模式](https://martinfowler.com/eaaDev/DomainEvent.html)
+
+## 5. 时序图
+
+### 单聊发送消息时序图（修正版）
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Controller as IMController
+    participant CmdFacade as MessageCmdFacade
+    participant DomainFacade as MessageDomainFacade
+    participant ConvRepo as ConversationRepository
+    participant MsgRepo as MessageRepository
+    participant WebSocket as WebSocketHandler
+    participant MQ as RocketMQ
+    
+    Client->>Controller: 发送私聊消息
+    Controller->>CmdFacade: sendPrivateMessage(request)
+    
+    Note over CmdFacade: 验证权限和参数
+    CmdFacade->>ConvRepo: 查询或创建单聊会话
+    ConvRepo-->>CmdFacade: 返回会话信息
+    
+    CmdFacade->>DomainFacade: send(message)
+    Note over DomainFacade: 验证消息格式和内容
+    DomainFacade->>MsgRepo: 保存消息
+    MsgRepo-->>DomainFacade: 返回保存结果
+    
+    Note over CmdFacade: 更新会话最后消息
+    CmdFacade->>ConvRepo: updateLastMessage(conversationId, messageId)
+    
+    Note over CmdFacade: 发送消息通知
+    CmdFacade->>MQ: 发送消息事件
+    MQ->>WebSocket: 消费消息事件
+    WebSocket->>Client: 推送消息给接收方
+    
+    DomainFacade-->>CmdFacade: 返回发送结果
+    CmdFacade-->>Controller: 返回结果
+    Controller-->>Client: 返回成功
+```
+
+### 群聊创建时序图（修正版）
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Controller as IMController
+    participant CmdFacade as ConversationCmdFacade
+    participant DomainFacade as ConversationDomainFacade
+    participant ConvRepo as ConversationRepository
+    participant MemberRepo as ConversationMemberRepository
+    participant EventBus as 事件总线
+    participant MQ as RocketMQ
+    
+    Client->>Controller: 创建群聊
+    Controller->>CmdFacade: createGroupConversation(request)
+    
+    Note over CmdFacade: 验证创建者权限
+    Note over CmdFacade: 验证成员数量限制
+    
+    CmdFacade->>DomainFacade: create(conversation)
+    DomainFacade->>ConvRepo: 保存群聊会话
+    ConvRepo-->>DomainFacade: 返回会话ID
+    
+    Note over CmdFacade: 批量创建会话成员
+    loop 每个成员
+        CmdFacade->>MemberRepo: 保存会话成员
+    end
+    
+    Note over CmdFacade: 发布群聊创建事件
+    CmdFacade->>EventBus: 发布ConversationCreatedEvent
+    EventBus->>MQ: 发送创建通知
+    
+    DomainFacade-->>CmdFacade: 返回创建结果
+    CmdFacade-->>Controller: 返回群聊信息
+    Controller-->>Client: 返回成功
+```
+
+### Spring WebSocket详细交互时序图
+
+#### WebSocket连接建立时序图
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Gateway as API网关
+    participant LB as 负载均衡器
+    participant Server as WebSocket服务器
+    participant AuthService as 认证服务
+    participant Redis as Redis缓存
+    participant SessionMgr as 会话管理器
+    
+    Note over Client: 用户点击进入聊天页面
+    
+    Client->>Gateway: WebSocket握手请求<br/>ws://domain/ws/im?token=xxx
+    Note over Gateway: 验证token有效性
+    Gateway->>AuthService: 验证用户token
+    AuthService-->>Gateway: 返回用户信息
+    
+    Gateway->>LB: 转发WebSocket请求<br/>X-User-Info: {userInfo}
+    LB->>Server: 随机分发到服务实例
+    
+    Note over Server: HandshakeInterceptor拦截
+    Server->>Server: beforeHandshake()<br/>解析用户信息，检查连接限制
+    
+    alt 握手成功
+        Server->>Client: 101 Switching Protocols<br/>连接升级成功
+        
+        Note over Server: WebSocketHandler处理
+        Server->>SessionMgr: afterConnectionEstablished()<br/>注册用户连接
+        SessionMgr->>Redis: 记录用户在线状态<br/>SET user:online:{userId} {serverId}
+        
+        Server->>Client: 发送连接成功消息<br/>{"type":"CONNECT_SUCCESS","data":{...}}
+        
+        Note over Server: 推送离线消息
+        Server->>SessionMgr: pushOfflineMessages(userId)
+        SessionMgr-->>Client: 批量推送离线消息
+        
+    else 握手失败
+        Server-->>Client: 403 Forbidden<br/>认证失败或连接超限
+    end
+```
+
+#### WebSocket消息发送时序图
+```mermaid
+sequenceDiagram
+    participant Client1 as 发送方客户端
+    participant Server1 as WebSocket服务器1
+    participant MQ as RocketMQ
+    participant Server2 as WebSocket服务器2
+    participant Client2 as 接收方客户端
+    participant Redis as Redis缓存
+    participant MySQL as MySQL数据库
+    
+    Note over Client1: 用户在输入框输入消息并发送
+    
+    Client1->>Server1: WebSocket消息<br/>{"type":"SEND_MESSAGE","data":{...}}
+    
+    Note over Server1: WebSocketController处理
+    Server1->>Server1: 解析消息内容，验证权限
+    Server1->>MySQL: 保存消息到数据库
+    MySQL-->>Server1: 返回消息ID
+    
+    Note over Server1: 查找接收方位置
+    Server1->>Redis: 查询接收方在线状态<br/>GET user:online:{receiverId}
+    Redis-->>Server1: 返回服务器ID或null
+    
+    alt 接收方在线
+        Server1->>MQ: 发送消息路由事件<br/>{"targetServerId":"server2","message":{...}}
+        MQ->>Server2: 消费消息事件
+        
+        Note over Server2: 检查用户是否在本服务器
+        Server2->>Server2: isUserOnlineLocally(receiverId)
+        
+        alt 用户在本服务器
+            Server2->>Client2: 推送消息<br/>{"type":"NEW_MESSAGE","data":{...}}
+            Client2->>Client2: 显示新消息，播放提示音
+            
+            Note over Client2: 用户查看消息（标记已读）
+            Client2->>Server2: {"type":"MESSAGE_READ","messageId":123}
+            Server2->>MySQL: 更新已读状态
+            Server2->>MQ: 发送已读状态事件
+            MQ->>Server1: 消费已读事件
+            Server1->>Client1: 推送已读回执<br/>{"type":"MESSAGE_READ_ACK","messageId":123}
+            
+        else 用户不在本服务器
+            Note over Server2: 忽略该消息
+        end
+        
+    else 接收方离线
+        Server1->>MySQL: 存储离线消息<br/>INSERT INTO t_offline_message
+    end
+    
+    Server1->>Client1: 返回发送成功<br/>{"type":"SEND_SUCCESS","messageId":123}
+```
+
+#### WebSocket心跳机制时序图
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Server as WebSocket服务器
+    participant Redis as Redis缓存
+    
+    Note over Client,Server: 连接建立后开始心跳机制
+    
+    loop 每30秒
+        Client->>Server: 心跳包<br/>{"type":"HEARTBEAT","timestamp":1640995200000}
+        Server->>Redis: 更新最后活跃时间<br/>SET user:active:{userId} {timestamp}
+        Server->>Client: 心跳响应<br/>{"type":"HEARTBEAT_ACK","timestamp":1640995201000}
+    end
+    
+    Note over Server: 服务端定时检测（每60秒）
+    
+    loop 每60秒
+        Server->>Redis: 检查用户最后活跃时间<br/>GET user:active:{userId}
+        Redis-->>Server: 返回时间戳
+        
+        alt 超过5分钟无心跳
+            Server->>Server: 关闭WebSocket连接
+            Server->>Redis: 清理用户在线状态<br/>DEL user:online:{userId}
+            Note over Server: 触发用户下线事件
+        end
+    end
+```
+
+#### WebSocket连接断开时序图
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Server as WebSocket服务器
+    participant Redis as Redis缓存
+    participant MQ as RocketMQ
+    participant SessionMgr as 会话管理器
+    
+    Note over Client: 用户关闭浏览器或网络断开
+    
+    alt 正常关闭
+        Client->>Server: WebSocket关闭帧
+        Server->>SessionMgr: afterConnectionClosed()
+        
+    else 异常断开
+        Note over Server: 检测到连接异常
+        Server->>SessionMgr: afterConnectionClosed()
+    end
+    
+    SessionMgr->>Redis: 清理用户在线状态<br/>DEL user:online:{userId}
+    SessionMgr->>Redis: 清理连接详情<br/>DEL connection:{sessionId}
+    
+    SessionMgr->>MQ: 发送用户下线事件<br/>UserOfflineEvent
+    
+    Note over SessionMgr: 清理本地会话缓存
+    SessionMgr->>SessionMgr: localSessions.remove(userId)
+    
+    Note over Server: 日志记录
+    Server->>Server: log.info("用户{}连接断开", userId)
+```
+
+**参考资料**：
+- [Spring WebSocket官方文档](https://docs.spring.io/spring-framework/docs/current/reference/html/web.html#websocket)
+- [WebSocket协议详解](https://www.ruanyifeng.com/blog/2017/05/websocket.html)
+- [Spring WebSocket集群方案](https://www.cnblogs.com/guoapeng/p/17020317.html)
+
+## 6. 应用服务层
+
+### Facade接口设计
+
+#### ConversationCmdFacade（会话命令门面）
+```java
+/**
+ * 会话命令门面
+ */
+public interface ConversationCmdFacade {
+    
+    /**
+     * 创建单聊会话
+     */
+    ConversationDTO createPrivateConversation(CreatePrivateConversationRequest request);
+    
+    /**
+     * 创建群聊会话
+     */
+    ConversationDTO createGroupConversation(CreateGroupConversationRequest request);
+    
+    /**
+     * 邀请成员加入群聊
+     */
+    boolean inviteMembersToGroup(InviteMembersRequest request);
+    
+    /**
+     * 移除群聊成员
+     */
+    boolean removeMemberFromGroup(RemoveMemberRequest request);
+    
+    /**
+     * 更新会话设置
+     */
+    boolean updateConversationSetting(UpdateConversationSettingRequest request);
+    
+    /**
+     * 解散群聊
+     */
+    boolean dissolveGroup(DissolveGroupRequest request);
+    
+    /**
+     * 退出群聊
+     */
+    boolean exitGroup(ExitGroupRequest request);
+}
+```
+
+#### ConversationQueryFacade（会话查询门面）
+```java
+/**
+ * 会话查询门面
+ */
+public interface ConversationQueryFacade {
+    
+    /**
+     * 分页查询用户会话列表
+     */
+    PageList<ConversationDTO> pageUserConversations(QueryUserConversationsParam param, PageParam pageParam);
+    
+    /**
+     * 查询会话详情
+     */
+    ConversationDTO getConversationDetail(QueryConversationDetailParam param);
+    
+    /**
+     * 查询会话成员列表
+     */
+    List<ConversationMemberDTO> getConversationMembers(QueryConversationMembersParam param);
+    
+    /**
+     * 查询用户在会话中的角色和权限
+     */
+    ConversationMemberDTO getUserRoleInConversation(QueryUserRoleParam param);
+    
+    /**
+     * 查询会话消息历史
+     */
+    PageList<MessageDTO> pageConversationMessages(QueryConversationMessagesParam param, PageParam pageParam);
+}
+```
+
+#### MessageCmdFacade（消息命令门面 - 扩展现有）
+```java
+/**
+ * 消息命令门面 - 扩展现有
+ */
+public interface MessageCmdFacade {
+    
+    // 现有方法保持不变
+    
+    /**
+     * 发送IM私聊消息
+     */
+    MessageDTO sendPrivateMessage(SendPrivateMessageRequest request);
+    
+    /**
+     * 发送IM群聊消息
+     */
+    MessageDTO sendGroupMessage(SendGroupMessageRequest request);
+    
+    /**
+     * 撤回消息
+     */
+    boolean recallMessage(RecallMessageRequest request);
+    
+    /**
+     * 转发消息
+     */
+    MessageDTO forwardMessage(ForwardMessageRequest request);
+    
+    /**
+     * 标记消息已读
+     */
+    boolean markMessageRead(MarkMessageReadRequest request);
+    
+    /**
+     * 批量标记会话消息已读
+     */
+    boolean markConversationRead(MarkConversationReadRequest request);
+}
+```
+
+#### MessageQueryFacade（消息查询门面 - 扩展现有）
+```java
+/**
+ * 消息查询门面 - 扩展现有
+ */
+public interface MessageQueryFacade {
+    
+    // 现有方法保持不变
+    
+    /**
+     * 查询IM消息列表
+     */
+    PageList<MessageDTO> pageIMMessages(QueryIMMessagesParam param, PageParam pageParam);
+    
+    /**
+     * 查询会话中的消息
+     */
+    PageList<MessageDTO> pageConversationMessages(QueryConversationMessagesParam param, PageParam pageParam);
+    
+    /**
+     * 查询消息详情（包含回复信息）
+     */
+    MessageDetailDTO getMessageDetail(QueryMessageDetailParam param);
+    
+    /**
+     * 搜索消息内容
+     */
+    PageList<MessageDTO> searchMessages(SearchMessagesParam param, PageParam pageParam);
+    
+    /**
+     * 查询用户未读消息统计
+     */
+    UnreadStatisticDTO getUnreadStatistic(QueryUnreadStatisticParam param);
+}
+```
+
+### DomainFacade接口设计
+
+#### ConversationDomainFacade（会话领域门面）
+```java
+/**
+ * 会话领域门面
+ */
+public interface ConversationDomainFacade {
+    
+    /**
+     * 获取或创建单聊会话
+     */
+    Conversation getOrCreatePrivateConversation(String firstIdentityId, String secondIdentityId);
+    
+    /**
+     * 创建群聊会话
+     */
+    Conversation createGroupConversation(Conversation conversation, List<ConversationMember> members);
+    
+    /**
+     * 添加会话成员
+     */
+    boolean addMember(Long conversationId, ConversationMember member);
+    
+    /**
+     * 移除会话成员
+     */
+    boolean removeMember(Long conversationId, String memberId, String operatorId);
+    
+    /**
+     * 更新最后消息信息
+     */
+    boolean updateLastMessage(Long conversationId, Long messageId, Long activeTime);
+    
+    /**
+     * 解散会话
+     */
+    boolean dissolveConversation(Long conversationId, String operatorId);
+    
+    /**
+     * 更新会话设置
+     */
+    boolean updateSetting(Long conversationId, ConversationSetting setting);
+    
+    /**
+     * 查询会话详情
+     */
+    Conversation getById(Long conversationId);
+    
+    /**
+     * 查询用户会话列表
+     */
+    List<Conversation> getUserConversations(String identityId);
+    
+    /**
+     * 通过会话key查询
+     */
+    Conversation getByConversationKey(String conversationKey);
+}
+```
+
+#### MessageDomainFacade（消息领域门面 - 扩展现有）
+```java
+/**
+ * 消息领域门面 - 扩展现有
+ */
+public interface MessageDomainFacade {
+    
+    // 现有方法保持不变
+    
+    /**
+     * 发送IM消息
+     */
+    boolean sendIMMessage(Message message);
+    
+    /**
+     * 撤回消息
+     */
+    boolean recallMessage(Long messageId, String operatorId);
+    
+    /**
+     * 查询会话消息
+     */
+    PageList<Message> pageConversationMessages(String conversationId, PageParam pageParam);
+    
+    /**
+     * 更新消息状态
+     */
+    boolean updateMessageStatus(Long messageId, Integer status);
+    
+    /**
+     * 查询IM消息列表
+     */
+    List<Message> getIMMessages(QueryIMMessagesParam param);
+}
+```
+
+## 7. 领域服务层
+
+### DomainService设计
+
+#### ConversationDomainService（会话领域服务）
+```java
+/**
+ * 会话领域服务
+ */
+public class ConversationDomainService {
+    
+    private static final String CONVERSATION_INSERT_LOCK_PREFIX = "CONVERSATION_INSERT_";
+    private static final String CONVERSATION_UPDATE_LOCK_PREFIX = "CONVERSATION_UPDATE_";
+    
+    /**
+     * 生成会话唯一标识
+     */
+    public static String generateConversationKey(ConversationType type, String... memberIds) {
+        switch (type.getType()) {
+            case "private":
+                // 单聊：private_min(id1,id2)_max(id1,id2)
+                List<String> sortedIds = Arrays.stream(memberIds).sorted().collect(Collectors.toList());
+                return String.format("private_%s_%s", sortedIds.get(0), sortedIds.get(1));
+            case "group":
+                // 群聊：group_随机UUID
+                return "group_" + UUID.randomUUID().toString().replace("-", "");
+            case "system":
+                // 系统通知：system_{identity_id}
+                return "system_" + memberIds[0];
+            case "assistant":
+                // 平台客服：assistant_{identity_id}
+                return "assistant_" + memberIds[0];
+            default:
+                throw new IllegalArgumentException("Unknown conversation type: " + type.getType());
+        }
+    }
+    
+    /**
+     * 验证成员数量限制
+     */
+    public static void validateMemberCount(Conversation conversation, int newMemberCount) {
+        AssertUtil.that(conversation != null, BasicErrorCode.PARAM_ERROR, "conversation null");
+        AssertUtil.that(newMemberCount <= conversation.getMaxMemberCount(), 
+                        BasicErrorCode.BUSINESS_ERROR, "超过最大成员数量限制");
+    }
+    
+    /**
+     * 验证用户是否有权限操作会话
+     */
+    public static void validateOperationPermission(Conversation conversation, String operatorId, String permission) {
+        AssertUtil.that(conversation != null, BasicErrorCode.PARAM_ERROR, "conversation null");
+        
+        ConversationMember operator = conversation.getMemberList().stream()
+                .filter(member -> operatorId.equals(member.getMemberUser().getIdentityId()))
+                .findFirst()
+                .orElse(null);
+        
+        AssertUtil.that(operator != null, BasicErrorCode.PERMISSION_DENIED, "用户不在会话中");
+        AssertUtil.that(operator.getMemberRole().getPermissions().contains(permission), 
+                        BasicErrorCode.PERMISSION_DENIED, "权限不足");
+    }
+    
+    /**
+     * 计算单聊未读数量
+     */
+    public static void calculatePrivateChatUnreadCount(Conversation conversation, String identityId) {
+        if (!"private".equals(conversation.getConversationType().getType())) {
+            return;
+        }
+        
+        // 根据身份ID判断是第一个还是第二个身份
+        if (conversation.getFirstIdentity().getIdentityId().equals(identityId)) {
+            // 计算第一个身份的未读数
+            // 这里需要调用Repository查询未读消息数量
+        } else if (conversation.getSecondIdentity().getIdentityId().equals(identityId)) {
+            // 计算第二个身份的未读数
+        }
+    }
+    
+    /**
+     * 获取分布式锁键 - 插入操作
+     */
+    public static String getDistributedLockKeyForInsert(String conversationKey) {
+        return UniqueKeyUtil.generateUniqueKey(CONVERSATION_INSERT_LOCK_PREFIX, conversationKey);
+    }
+    
+    /**
+     * 获取分布式锁键 - 更新操作
+     */
+    public static String getDistributedLockKeyForUpdate(Long conversationId) {
+        return UniqueKeyUtil.generateUniqueKey(CONVERSATION_UPDATE_LOCK_PREFIX, conversationId);
+    }
+}
+```
+
+#### MessageDomainService（消息领域服务 - 扩展现有）
+```java
+/**
+ * 消息领域服务 - 扩展现有
+ */
+public class MessageDomainService {
+    
+    // ... 现有方法保持不变
+    
+    /**
+     * 判断是否为IM消息
+     */
+    public static boolean isIMMessage(Message message) {
+        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
+        
+        Integer relatingBizType = message.getMessageBody().getRelatingBizType();
+        return relatingBizType != null && (relatingBizType == 19 || relatingBizType == 20 || relatingBizType == 21);
+    }
+    
+    /**
+     * 判断是否为业务消息
+     */
+    public static boolean isBusinessMessage(Message message) {
+        return !isIMMessage(message);
+    }
+    
+    /**
+     * 撤回消息
+     */
+    public static void recallMessage(Message message, String operatorId) {
+        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
+        AssertUtil.that(!message.getIsRecalled(), BasicErrorCode.BUSINESS_ERROR, "消息已撤回");
+        
+        // 验证撤回权限（只有发送者可以撤回，或者管理员）
+        String senderId = message.getSender().getSenderUser().getIdentityId();
+        AssertUtil.that(senderId.equals(operatorId), BasicErrorCode.PERMISSION_DENIED, "只能撤回自己的消息");
+        
+        // 验证撤回时间限制（比如2分钟内）
+        long currentTime = System.currentTimeMillis();
+        long sendTime = message.getCreateTime();
+        long timeDiff = currentTime - sendTime;
+        AssertUtil.that(timeDiff <= 2 * 60 * 1000, BasicErrorCode.BUSINESS_ERROR, "超过撤回时间限制");
+        
+        message.setIsRecalled(true);
+        message.setRecallTime(currentTime);
+    }
+    
+    /**
+     * 验证消息格式
+     */
+    public static void validateMessageFormat(Message message) {
+        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
+        
+        MessageFormat format = message.getMessageFormat();
+        if (format == null) {
+            return;
+        }
+        
+        // 验证文件大小限制
+        if (message.getFileSize() != null && message.getFileSize() > format.getMaxSize()) {
+            throw new BusinessException(BasicErrorCode.BUSINESS_ERROR, "文件大小超过限制");
+        }
+        
+        // 验证内容长度
+        String content = message.getMessageBody().getContent();
+        if (format.getFormat() == 0 && content != null && content.length() > format.getMaxSize()) {
+            throw new BusinessException(BasicErrorCode.BUSINESS_ERROR, "文本内容过长");
+        }
+    }
+    
+    /**
+     * 填充会话相关信息
+     */
+    public static void fillConversationInfo(Message message, Conversation conversation) {
+        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
+        AssertUtil.that(conversation != null, BasicErrorCode.PARAM_ERROR, "conversation null");
+        
+        message.setConversationId(conversation.getConversationId().toString());
+        message.getMessageBody().setConversationId(conversation.getConversationId().toString());
+    }
+}
+```
+
+#### ConversationMemberDomainService（会话成员领域服务）
+```java
+/**
+ * 会话成员领域服务
+ */
+public class ConversationMemberDomainService {
+    
+    /**
+     * 更新成员角色
+     */
+    public static void updateMemberRole(ConversationMember member, MemberRole newRole, String operatorId) {
+        AssertUtil.that(member != null, BasicErrorCode.PARAM_ERROR, "member null");
+        AssertUtil.that(newRole != null, BasicErrorCode.PARAM_ERROR, "newRole null");
+        
+        // 验证操作权限（只有群主可以设置管理员，管理员和群主可以设置普通成员）
+        MemberRole operatorRole = getCurrentMemberRole(member.getConversationId(), operatorId);
+        validateRoleChangePermission(operatorRole, member.getMemberRole(), newRole);
+        
+        member.setMemberRole(newRole);
+    }
+    
+    /**
+     * 成员退出会话
+     */
+    public static void exitConversation(ConversationMember member) {
+        AssertUtil.that(member != null, BasicErrorCode.PARAM_ERROR, "member null");
+        AssertUtil.that(MemberStatus.ACTIVE.equals(member.getMemberStatus().getStatus()), 
+                        BasicErrorCode.BUSINESS_ERROR, "成员状态异常");
+        
+        member.setMemberStatus(MemberStatus.exited());
+        member.setExitTime(System.currentTimeMillis());
+    }
+    
+    /**
+     * 更新最后已读消息
+     */
+    public static void updateLastReadMessage(ConversationMember member, Long messageId) {
+        AssertUtil.that(member != null, BasicErrorCode.PARAM_ERROR, "member null");
+        AssertUtil.that(messageId != null, BasicErrorCode.PARAM_ERROR, "messageId null");
+        
+        // 验证消息ID有效性
+        if (member.getLastReadMessageId() != null && messageId <= member.getLastReadMessageId()) {
+            return; // 不能回退已读位置
+        }
+        
+        member.setLastReadMessageId(messageId);
+        // 未读数的重新计算在Repository层处理
+    }
+    
+    /**
+     * 计算群聊未读数量
+     */
+    public static Long calculateGroupUnreadCount(ConversationMember member, Long totalMessageCount) {
+        if (member.getLastReadMessageId() == null) {
+            return totalMessageCount;
+        }
+        // 具体计算逻辑在Repository层实现
+        return 0L;
+    }
+    
+    private static MemberRole getCurrentMemberRole(Long conversationId, String identityId) {
+        // 这里需要调用Repository查询当前用户在会话中的角色
+        // 为了示例，返回普通成员角色
+        return MemberRole.member();
+    }
+    
+    private static void validateRoleChangePermission(MemberRole operatorRole, MemberRole currentRole, MemberRole newRole) {
+        // 验证角色变更权限的具体逻辑
+        // 群主可以设置任何角色，管理员只能设置普通成员
+    }
+}
+```
 
 ### DomainStatusFacade设计
 
