@@ -391,13 +391,6 @@ CHECK (
 #### 扩展现有表
 1. **t_msg_body** - 新增IM相关字段
 
-### 会话设计原则
-- A和B单聊与B和A单聊是天然的同一个会话，不能存在多个，而A和B可以创建多个群
-- conversation_key，单聊：private_min(id1,id2)_max(id1,id2)，容易判断单聊会话是否存在，保证唯一性
-- A的会话列表，跟B的单聊会话看到的是B的logo，而A跟B的群聊会话，看到的是群logo
-- 单聊只能有两个成员，每个成员的未读数量直接记录在会话表上，而群聊每个成员的未读数量记录在群成员表上
-- 群聊有自己的特性（群管理、群接龙游戏等），单聊是不适合的
-
 ### 字段说明
 #### conversation_key字段
 会话唯一标识，生成规则：
@@ -429,8 +422,8 @@ CHECK (
 ##### Conversation（会话聚合根）
 ```java
 /**
- * 会话聚合根
- * 统一管理单聊和群聊，通过conversation_type区分
+ * 会话聚合根 - 合并表设计
+ * 统一管理单聊、群聊、系统通知、客服会话，通过conversation_type区分
  */
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -449,11 +442,33 @@ public class Conversation extends BaseEntity {
     private Integer currentMemberCount;      // 当前成员数量
     private Integer maxMemberCount;          // 最大成员数量（单聊固定为2）
     
-    // 单聊专用字段（通过type区分使用）
-    private MessageUser firstIdentity;       // 第一个身份信息（值对象）
-    private MessageUser secondIdentity;      // 第二个身份信息（值对象）
-    private Long firstIdentityUnreadCount;   // 第一个身份未读数
-    private Long secondIdentityUnreadCount;  // 第二个身份未读数
+    // 单聊参与者信息（通过值对象封装）
+    private PrivateChatUser firstParticipant;  // 第一个参与者
+    private PrivateChatUser secondParticipant; // 第二个参与者
+    
+    // 系统通知配置（通过值对象封装）
+    private SystemNotificationConfig notificationConfig;
+    
+    // 客服配置（通过值对象封装）  
+    private CustomerServiceConfig serviceConfig;
+    
+    /**
+     * 判断是否需要成员表
+     */
+    public boolean needsMemberTable() {
+        return !conversationType.isPrivateChat();
+    }
+    
+    /**
+     * 获取单聊对方参与者
+     */
+    public PrivateChatUser getOtherParticipant(String currentUserId) {
+        if (!conversationType.isPrivateChat()) {
+            throw new BusinessException("仅单聊支持获取对方信息");
+        }
+        return firstParticipant.getIdentityId().equals(currentUserId) 
+            ? secondParticipant : firstParticipant;
+    }
 }
 ```
 
@@ -540,6 +555,156 @@ public class MessageBody extends CommonEntity {
 
 #### 值对象 (Value Object)
 
+##### PrivateChatUser（单聊参与者值对象）
+```java
+/**
+ * 单聊参与者值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class PrivateChatUser extends BaseValueObject {
+    private String identityId;               // 身份ID
+    private Integer identityType;            // 身份类型
+    private UnreadCount unreadCount;         // 未读数信息（值对象）
+    
+    /**
+     * 创建单聊参与者
+     */
+    public static PrivateChatUser create(String identityId, Integer identityType) {
+        return new PrivateChatUser(identityId, identityType, UnreadCount.zero());
+    }
+}
+```
+
+##### UnreadCount（未读计数值对象）
+```java
+/**
+ * 未读计数值对象 - 支持批量标记
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class UnreadCount extends BaseValueObject {
+    private Long unreadCount;                // 未读数量
+    private Long lastReadMessageId;          // 最后已读消息ID
+    private Long lastUpdateTime;             // 最后更新时间
+    
+    /**
+     * 零未读数
+     */
+    public static UnreadCount zero() {
+        return new UnreadCount(0L, null, System.currentTimeMillis());
+    }
+    
+    /**
+     * 批量标记已读到指定消息
+     */
+    public UnreadCount batchMarkReadTo(Long messageId) {
+        return new UnreadCount(0L, messageId, System.currentTimeMillis());
+    }
+}
+```
+
+##### MessageReply（消息回复信息值对象）
+```java
+/**
+ * 消息回复信息值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class MessageReply extends BaseValueObject {
+    private Long replyToMessageId;           // 回复消息ID
+    private String replyToContent;           // 回复消息内容摘要
+    private String replyToSenderId;          // 回复消息发送者ID
+}
+```
+
+##### MessageFile（文件信息值对象）
+```java
+/**
+ * 文件信息值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class MessageFile extends BaseValueObject {
+    private String fileUrl;                  // 文件URL
+    private String fileName;                 // 文件名称
+    private Long fileSize;                   // 文件大小
+    private String fileMimeType;             // 文件MIME类型
+    private Integer duration;                // 音视频时长(秒)
+}
+```
+
+##### MessageStatus（消息状态值对象）
+```java
+/**
+ * 消息状态值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class MessageStatus extends BaseValueObject {
+    private Boolean isRecalled;              // 是否已撤回
+    private Long recallTime;                 // 撤回时间
+    private Integer deliveryStatus;          // 投递状态(0发送中1已送达2已读)
+}
+```
+
+##### MemberJoinInfo（成员加入信息值对象）
+```java
+/**
+ * 成员加入信息值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class MemberJoinInfo extends BaseValueObject {
+    private Long joinTime;                   // 加入时间
+    private Long exitTime;                   // 退出时间
+    private String inviterId;                // 邀请人ID
+    private String joinSource;               // 加入来源
+}
+```
+
+##### MemberSetting（成员设置值对象）
+```java
+/**
+ * 成员设置值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class MemberSetting extends BaseValueObject {
+    private Boolean muteNotification;        // 是否静音通知
+    private String nickname;                 // 群内昵称
+    private Boolean showMemberNickname;      // 是否显示群成员昵称
+}
+```
+
+##### SystemNotificationConfig（系统通知配置值对象）
+```java
+/**
+ * 系统通知配置值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class SystemNotificationConfig extends BaseValueObject {
+    private String notificationType;         // 通知类型
+    private Boolean enablePush;              // 是否启用推送
+    private String businessModule;           // 业务模块
+}
+```
+
+##### CustomerServiceConfig（客服配置值对象）
+```java
+/**
+ * 客服配置值对象
+ */
+@Data
+@EqualsAndHashCode(callSuper = true)
+public class CustomerServiceConfig extends BaseValueObject {
+    private String serviceType;             // 服务类型
+    private String businessCategory;         // 业务分类
+    private Boolean autoAssign;              // 是否自动分配客服
+}
+```
+
 ##### ConversationType（会话类型值对象）
 ```java
 /**
@@ -551,6 +716,20 @@ public class ConversationType extends BaseValueObject {
     private String type;                     // 类型编码
     private String typeName;                 // 类型名称
     private Integer maxMemberCount;          // 最大成员数量
+    
+    /**
+     * 判断是否需要成员表
+     */
+    public boolean needsMemberTable() {
+        return !"private".equals(type);
+    }
+    
+    /**
+     * 判断是否为单聊
+     */
+    public boolean isPrivateChat() {
+        return "private".equals(type);
+    }
 }
 ```
 
@@ -800,35 +979,49 @@ public class ConversationMemberDomainService {
 sequenceDiagram
     participant Client as 客户端
     participant Controller as IMController
+    participant Facade as IMMessageFacade
     participant CmdFacade as MessageCmdFacade
-    participant DomainFacade as MessageDomainFacade
+    participant ConvDomainFacade as ConversationDomainFacade
+    participant MsgDomainFacade as MessageDomainFacade
     participant ConvRepo as ConversationRepository
     participant MsgRepo as MessageRepository
-    participant WebSocket as WebSocketHandler
+    participant WebSocket as WebSocketService
     participant MQ as RocketMQ
     
     Client->>Controller: 发送私聊消息
-    Controller->>CmdFacade: sendPrivateMessage(request)
+    Controller->>Facade: sendPrivateMessage(request)
+    Facade->>CmdFacade: sendPrivateMessage(request)
     
     Note over CmdFacade: 验证权限和参数
-    CmdFacade->>ConvRepo: 查询或创建单聊会话
-    ConvRepo-->>CmdFacade: 返回会话信息
+    CmdFacade->>ConvDomainFacade: getOrCreatePrivateConversation(senderId, receiverId)
+    ConvDomainFacade->>ConvRepo: getByConversationKey(conversationKey)
     
-    CmdFacade->>DomainFacade: send(message)
-    Note over DomainFacade: 验证消息格式和内容
-    DomainFacade->>MsgRepo: 保存消息
-    MsgRepo-->>DomainFacade: 返回保存结果
+    alt 会话不存在
+        ConvDomainFacade->>ConvRepo: save(conversation)
+        Note over ConvRepo: 合并表设计：保存单聊参与者信息到conversation表
+    end
     
-    Note over CmdFacade: 更新会话最后消息
-    CmdFacade->>ConvRepo: updateLastMessage(conversationId, messageId)
+    ConvRepo-->>ConvDomainFacade: 返回会话信息
+    ConvDomainFacade-->>CmdFacade: 返回会话
+    
+    CmdFacade->>MsgDomainFacade: sendIMMessage(message)
+    Note over MsgDomainFacade: 验证消息格式和内容
+    MsgDomainFacade->>MsgRepo: save(message)
+    MsgRepo-->>MsgDomainFacade: 返回消息ID
+    
+    Note over CmdFacade: 更新会话最后消息和未读数
+    CmdFacade->>ConvDomainFacade: updateLastMessage(conversationId, messageId)
+    CmdFacade->>ConvDomainFacade: incrementPrivateChatUnread(conversationId, receiverId)
+    ConvDomainFacade->>ConvRepo: update(conversationId, updater)
     
     Note over CmdFacade: 发送消息通知
     CmdFacade->>MQ: 发送消息事件
     MQ->>WebSocket: 消费消息事件
     WebSocket->>Client: 推送消息给接收方
     
-    DomainFacade-->>CmdFacade: 返回发送结果
-    CmdFacade-->>Controller: 返回结果
+    MsgDomainFacade-->>CmdFacade: 返回发送结果
+    CmdFacade-->>Facade: 返回结果
+    Facade-->>Controller: 返回结果
     Controller-->>Client: 返回成功
 ```
 
@@ -837,34 +1030,42 @@ sequenceDiagram
 sequenceDiagram
     participant Client as 客户端
     participant Controller as IMController
+    participant Facade as ConversationFacade
     participant CmdFacade as ConversationCmdFacade
     participant DomainFacade as ConversationDomainFacade
     participant ConvRepo as ConversationRepository
-    participant MemberRepo as ConversationMemberRepository
     participant EventBus as 事件总线
     participant MQ as RocketMQ
     
     Client->>Controller: 创建群聊
-    Controller->>CmdFacade: createGroupConversation(request)
+    Controller->>Facade: createGroupConversation(request)
+    Facade->>CmdFacade: createGroupConversation(request)
     
     Note over CmdFacade: 验证创建者权限
     Note over CmdFacade: 验证成员数量限制
+    Note over CmdFacade: 构建会话和成员对象
     
-    CmdFacade->>DomainFacade: create(conversation)
-    DomainFacade->>ConvRepo: 保存群聊会话
+    CmdFacade->>DomainFacade: createGroupConversation(conversation, members)
+    
+    Note over DomainFacade: 事务开始：创建群聊和成员
+    DomainFacade->>ConvRepo: save(conversation)
     ConvRepo-->>DomainFacade: 返回会话ID
     
-    Note over CmdFacade: 批量创建会话成员
-    loop 每个成员
-        CmdFacade->>MemberRepo: 保存会话成员
-    end
+    Note over DomainFacade: 批量保存会话成员到member表
+    DomainFacade->>DomainFacade: batchAddMembers(conversationId, members)
+    DomainFacade->>ConvRepo: batchSaveMembers(members)
+    
+    Note over DomainFacade: 更新会话成员数量
+    DomainFacade->>ConvRepo: update(conversationId, updater)
+    
+    DomainFacade-->>CmdFacade: 返回创建结果
     
     Note over CmdFacade: 发布群聊创建事件
     CmdFacade->>EventBus: 发布ConversationCreatedEvent
-    EventBus->>MQ: 发送创建通知
+    EventBus->>MQ: 发送创建通知给所有成员
     
-    DomainFacade-->>CmdFacade: 返回创建结果
-    CmdFacade-->>Controller: 返回群聊信息
+    CmdFacade-->>Facade: 返回群聊信息
+    Facade-->>Controller: 返回结果
     Controller-->>Client: 返回成功
 ```
 
@@ -1195,10 +1396,12 @@ public interface MessageQueryFacade {
 #### ConversationDomainFacade（会话领域门面）
 ```java
 /**
- * 会话领域门面
+ * 会话领域门面 - 聚合根统一管理
+ * 会话成员作为实体由聚合根统一管理，不单独创建DomainFacade
  */
 public interface ConversationDomainFacade {
     
+    // === 会话管理 ===
     /**
      * 获取或创建单聊会话
      */
@@ -1208,16 +1411,6 @@ public interface ConversationDomainFacade {
      * 创建群聊会话
      */
     Conversation createGroupConversation(Conversation conversation, List<ConversationMember> members);
-    
-    /**
-     * 添加会话成员
-     */
-    boolean addMember(Long conversationId, ConversationMember member);
-    
-    /**
-     * 移除会话成员
-     */
-    boolean removeMember(Long conversationId, String memberId, String operatorId);
     
     /**
      * 更新最后消息信息
@@ -1248,6 +1441,63 @@ public interface ConversationDomainFacade {
      * 通过会话key查询
      */
     Conversation getByConversationKey(String conversationKey);
+    
+    // === 会话成员管理（实体管理纳入聚合根） ===
+    /**
+     * 添加会话成员
+     */
+    boolean addMember(Long conversationId, ConversationMember member);
+    
+    /**
+     * 批量添加会话成员
+     */
+    boolean batchAddMembers(Long conversationId, List<ConversationMember> members);
+    
+    /**
+     * 移除会话成员
+     */
+    boolean removeMember(Long conversationId, String memberId, String operatorId);
+    
+    /**
+     * 更新成员角色
+     */
+    boolean updateMemberRole(Long conversationId, String memberId, MemberRole newRole, String operatorId);
+    
+    /**
+     * 查询会话成员列表
+     */
+    List<ConversationMember> getConversationMembers(Long conversationId);
+    
+    /**
+     * 查询用户在会话中的成员信息
+     */
+    ConversationMember getUserMemberInfo(Long conversationId, String identityId);
+    
+    // === 未读消息管理 ===
+    /**
+     * 单聊未读数增加
+     */
+    boolean incrementPrivateChatUnread(Long conversationId, String receiverId);
+    
+    /**
+     * 群聊未读数增加
+     */
+    boolean incrementGroupChatUnread(Long conversationId, List<String> memberIds);
+    
+    /**
+     * 标记单聊消息已读
+     */
+    boolean markPrivateChatRead(Long conversationId, String readerId, Long messageId);
+    
+    /**
+     * 标记群聊消息已读
+     */
+    boolean markGroupChatRead(Long conversationId, String readerId, Long messageId);
+    
+    /**
+     * 批量标记消息已读（支持防抖批量方案）
+     */
+    boolean batchMarkMessagesRead(Long conversationId, String readerId, List<Long> messageIds);
 }
 ```
 
@@ -1700,13 +1950,23 @@ CREATE TABLE t_conversation (
     current_member_count INT DEFAULT 0 COMMENT '当前成员数量',
     max_member_count INT DEFAULT 500 COMMENT '最大成员数量',
     
-    -- 单聊专用字段
-    first_identity_id VARCHAR(50) COMMENT '第一个身份ID',
-    first_identity_type INT COMMENT '第一个身份类型',
-    first_identity_unread_count BIGINT DEFAULT 0 COMMENT '第一个身份未读数',
-    second_identity_id VARCHAR(50) COMMENT '第二个身份ID', 
-    second_identity_type INT COMMENT '第二个身份类型',
-    second_identity_unread_count BIGINT DEFAULT 0 COMMENT '第二个身份未读数',
+    -- 单聊参与者信息（conversation_type='private'时使用）
+    first_identity_id VARCHAR(50) COMMENT '第一个参与者身份ID',
+    first_identity_type INT COMMENT '第一个参与者身份类型',
+    first_unread_count BIGINT DEFAULT 0 COMMENT '第一个参与者未读数',
+    first_last_read_message_id BIGINT COMMENT '第一个参与者最后已读消息ID',
+    second_identity_id VARCHAR(50) COMMENT '第二个参与者身份ID', 
+    second_identity_type INT COMMENT '第二个参与者身份类型',
+    second_unread_count BIGINT DEFAULT 0 COMMENT '第二个参与者未读数',
+    second_last_read_message_id BIGINT COMMENT '第二个参与者最后已读消息ID',
+    
+    -- 系统通知配置（conversation_type='system'时使用）
+    notification_type VARCHAR(50) COMMENT '通知类型',
+    business_module VARCHAR(50) COMMENT '业务模块',
+    
+    -- 客服配置（conversation_type='assistant'时使用）
+    service_type VARCHAR(50) COMMENT '服务类型',
+    business_category VARCHAR(50) COMMENT '业务分类',
     
     source INT DEFAULT 0 COMMENT '来源',
     create_time BIGINT NOT NULL COMMENT '创建时间',
@@ -1716,8 +1976,15 @@ CREATE TABLE t_conversation (
     INDEX idx_conversation_type (conversation_type),
     INDEX idx_first_identity (first_identity_id, first_identity_type),
     INDEX idx_second_identity (second_identity_id, second_identity_type),
-    INDEX idx_last_active_time (last_active_time)
-) COMMENT='会话表';
+    INDEX idx_last_active_time (last_active_time),
+    
+    -- 约束：单聊时必须有两个参与者
+    CONSTRAINT check_private_chat CHECK (
+        (conversation_type = 'private' AND first_identity_id IS NOT NULL AND second_identity_id IS NOT NULL)
+        OR 
+        (conversation_type != 'private')
+    )
+) COMMENT='会话表-合并表设计';
 ```
 
 ##### t_conversation_member（会话成员表）
@@ -1831,107 +2098,7 @@ public class ConversationProcessor {
 }
 ```
 
-## 10. WebSocket协议
-
-### STOMP协议集成
-
-#### WebSocket配置
-```java
-/**
- * WebSocket配置
- */
-@Configuration
-@EnableWebSocketMessageBroker
-public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
-
-    @Override
-    public void configureMessageBroker(MessageBrokerRegistry config) {
-        // 启用内存消息代理，用于向客户端发送消息
-        config.enableSimpleBroker("/topic", "/queue");
-        // 设置应用程序的消息前缀
-        config.setApplicationDestinationPrefixes("/app");
-        // 设置点对点消息前缀
-        config.setUserDestinationPrefix("/user");
-    }
-
-    @Override
-    public void registerStompEndpoints(StompEndpointRegistry registry) {
-        // 注册WebSocket端点
-        registry.addEndpoint("/ws/im")
-                .setAllowedOriginPatterns("*")
-                .withSockJS();
-    }
-}
-```
-
-#### 消息推送服务
-```java
-/**
- * IM WebSocket服务
- */
-@Service
-public class IMWebSocketService {
-    
-    @Autowired
-    private SimpMessagingTemplate messagingTemplate;
-    
-    /**
-     * 推送私聊消息
-     */
-    public void sendPrivateMessage(String receiverId, MessageDTO message);
-    
-    /**
-     * 推送群聊消息
-     */
-    public void sendGroupMessage(String conversationId, MessageDTO message);
-    
-    /**
-     * 推送系统通知
-     */
-    public void sendSystemNotification(String userId, Object notification);
-    
-    /**
-     * 推送消息状态更新
-     */
-    public void sendMessageStatusUpdate(String conversationId, MessageStatusUpdateDTO status);
-}
-```
-
-### WebSocket消息控制器
-```java
-/**
- * IM WebSocket控制器
- */
-@Controller
-public class IMWebSocketController {
-    
-    @Autowired
-    private MessageCmdFacade messageCmdFacade;
-    
-    /**
-     * 发送私聊消息
-     */
-    @MessageMapping("/private.send")
-    public void sendPrivateMessage(@Payload SendPrivateMessageRequest request, 
-                                   SimpMessageHeaderAccessor headerAccessor);
-    
-    /**
-     * 发送群聊消息
-     */
-    @MessageMapping("/group.send")
-    public void sendGroupMessage(@Payload SendGroupMessageRequest request,
-                                SimpMessageHeaderAccessor headerAccessor);
-    
-    /**
-     * 标记消息已读
-     */
-    @MessageMapping("/message.read")
-    public void markMessageRead(@Payload MarkMessageReadRequest request,
-                               SimpMessageHeaderAccessor headerAccessor);
-}
-```
-
-## 11. 流程图
+## 10. 流程图
 
 ### IM消息发送流程
 ```mermaid
@@ -1996,6 +2163,193 @@ flowchart TD
     P --> Z
 ```
 
+## 11. 关键方案设计与选型
+
+### 11.1 多条未读消息前后端交互方案
+
+#### 方案对比分析
+
+当用户进入会话并有多条未读消息时，前后端交互存在以下几种方案：
+
+| 方案 | 交互方式 | 优势 | 劣势 | 适用场景 | 推荐度 |
+|------|----------|------|------|----------|--------|
+| **逐条标记方案** | 每查看一条消息立即发送已读请求 | 数据实时准确 | 网络开销大，用户体验差 | 消息量小的场景 | ⭐⭐ |
+| **离开时批量提交** | 前端记录，离开会话时统一提交 | 网络开销小 | 异常中断会丢失状态 | 网络不稳定环境 | ⭐⭐⭐ |
+| **滚动实时更新** | 根据滚动位置实时更新已读位置 | 用户体验好 | 实现复杂，滚动频繁 | 消息量大的场景 | ⭐⭐⭐⭐ |
+| **防抖批量方案** | 防抖动+批量提交的混合策略 | 平衡性能和体验 | 实现稍复杂 | 通用场景（推荐） | ⭐⭐⭐⭐⭐ |
+
+#### 推荐方案：防抖批量方案
+
+##### 核心设计思路
+```javascript
+// 前端防抖批量标记设计
+class UnreadMarkManager {
+    constructor() {
+        this.pendingMarks = new Set();  // 待标记消息ID集合
+        this.debounceTimer = null;      // 防抖定时器
+        this.DEBOUNCE_DELAY = 1000;     // 防抖延迟1秒
+        this.BATCH_SIZE = 50;           // 批量大小限制
+    }
+    
+    // 标记消息已读
+    markAsRead(messageId) {
+        this.pendingMarks.add(messageId);
+        this.scheduleCommit();
+    }
+    
+    // 防抖调度提交
+    scheduleCommit() {
+        if (this.debounceTimer) {
+            clearTimeout(this.debounceTimer);
+        }
+        
+        this.debounceTimer = setTimeout(() => {
+            this.commitBatch();
+        }, this.DEBOUNCE_DELAY);
+        
+        // 批量大小限制，立即提交
+        if (this.pendingMarks.size >= this.BATCH_SIZE) {
+            clearTimeout(this.debounceTimer);
+            this.commitBatch();
+        }
+    }
+    
+    // 批量提交到服务端
+    async commitBatch() {
+        if (this.pendingMarks.size === 0) return;
+        
+        const messageIds = Array.from(this.pendingMarks);
+        this.pendingMarks.clear();
+        
+        try {
+            await this.apiCall('/api/v1/messages/batch-read', {
+                messageIds: messageIds,
+                conversationId: this.currentConversationId
+            });
+        } catch (error) {
+            // 失败重试机制
+            messageIds.forEach(id => this.pendingMarks.add(id));
+            this.scheduleCommit();
+        }
+    }
+}
+```
+
+##### 服务端批量处理接口
+```java
+/**
+ * 批量标记消息已读
+ */
+@PostMapping("/batch-read")
+public Response<Boolean> batchMarkMessageRead(@RequestBody BatchMarkReadRequestVO request) {
+    // 参数验证
+    if (request.getMessageIds().size() > 100) {
+        throw new BusinessException("批量标记数量不能超过100条");
+    }
+    
+    // 批量更新数据库（事务保证）
+    boolean success = messageCmdFacade.batchMarkMessageRead(request);
+    
+    // 推送已读状态给其他设备
+    if (success) {
+        pushReadStatusToOtherDevices(request);
+    }
+    
+    return Response.success(success);
+}
+```
+
+#### 特殊场景处理
+
+##### 场景1：快速滚动大量消息
+```javascript
+// 基于视窗的智能标记
+class ViewportBasedMarking {
+    constructor() {
+        this.intersectionObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting && entry.intersectionRatio > 0.5) {
+                    // 消息在视窗中可见超过50%，标记为已读
+                    const messageId = entry.target.dataset.messageId;
+                    this.unreadManager.markAsRead(messageId);
+                }
+            });
+        }, {
+            threshold: [0.5]  // 可见50%以上才算已读
+        });
+    }
+}
+```
+
+##### 场景2：离线重连后状态恢复
+```javascript
+// 离线状态恢复机制
+class OfflineRecoveryManager {
+    // 离线时本地存储未提交的已读状态
+    saveOfflineState() {
+        const offlineData = {
+            conversationId: this.currentConversationId,
+            readMessageIds: Array.from(this.pendingMarks),
+            timestamp: Date.now()
+        };
+        localStorage.setItem('offline_read_state', JSON.stringify(offlineData));
+    }
+    
+    // 重连后恢复并提交
+    async recoverOnlineState() {
+        const offlineData = localStorage.getItem('offline_read_state');
+        if (offlineData) {
+            const data = JSON.parse(offlineData);
+            // 24小时内的离线状态才恢复
+            if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
+                await this.commitOfflineReads(data);
+            }
+            localStorage.removeItem('offline_read_state');
+        }
+    }
+}
+```
+
+##### 场景3：多端状态同步
+```java
+// 多端已读状态同步
+@Component
+public class MultiDeviceReadSyncProcessor {
+    
+    @EventListener
+    public void onMessageRead(MessageReadEvent event) {
+        // 查询用户的其他在线设备
+        List<String> otherDevices = getUserOtherOnlineDevices(event.getReaderId());
+        
+        // 推送已读状态给其他设备
+        ReadStatusSyncMessage syncMessage = ReadStatusSyncMessage.builder()
+                .conversationId(event.getConversationId())
+                .messageId(event.getMessageId())
+                .readTime(event.getReadTime())
+                .build();
+                
+        otherDevices.forEach(deviceId -> {
+            webSocketService.sendToDevice(deviceId, syncMessage);
+        });
+    }
+}
+```
+
+#### 性能优化策略
+
+| 优化维度 | 具体措施 | 性能提升 | 实现复杂度 |
+|----------|----------|----------|------------|
+| **防抖动控制** | 1秒内多次标记合并为一次请求 | 减少50%网络请求 | 低 |
+| **批量提交** | 最多50条消息一次性提交 | 减少数据库事务次数 | 低 |
+| **智能触发** | 视窗可见度+滚动停留时间判断 | 提升用户体验 | 中 |
+| **本地缓存** | 本地记录已读状态，减少重复标记 | 减少无效请求 | 中 |
+| **异常恢复** | 网络异常时本地暂存，恢复后补偿 | 提升可靠性 | 高 |
+
+**参考资料**：
+- [防抖节流最佳实践](https://developer.mozilla.org/en-US/docs/Web/API/Intersection_Observer_API)
+- [IM系统已读状态设计](https://www.cnblogs.com/flashsun/p/14318928.html)
+- [移动端IM优化策略](https://tech.meituan.com/2018/11/15/dianping-im-arch.html)
+
 ## 12. 关键方案设计与选型
 
 ### 核心架构决策
@@ -2021,7 +2375,6 @@ graph TD
     subgraph "客户端层"
         C1[Web客户端]
         C2[移动客户端]
-        C3[PC客户端]
     end
     
     subgraph "网关层"
@@ -2049,9 +2402,7 @@ graph TD
     
     C1 --> Gateway
     C2 --> Gateway
-    C3 --> Gateway
-    
-    Gateway -->|认证通过| LB
+    Gateway --> LB
     LB -->|随机分发| WS1
     LB -->|随机分发| WS2
     LB -->|随机分发| WS3
