@@ -1480,49 +1480,495 @@ flowchart TD
     P --> Z
 ```
 
-## 12. 技术选型
+## 12. 关键方案设计与选型
 
-### 核心技术栈
+### 核心架构决策
+
+基于CREATIVE模式的深入分析，确定了以下关键架构方案：
+
+#### 12.1 WebSocket集群架构设计
+
+**问题**: 在多实例集群环境下，WebSocket连接是有状态的，需要解决消息路由和连接管理问题。
+
+**方案对比**:
+
+| 方案 | 描述 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|----------|
+| 粘性会话+Redis广播 | 负载均衡器粘性会话，Redis发布订阅 | 实现简单，技术成熟 | 实例故障影响用户 | 中小规模，快速上线 |
+| WebSocket网关 | 独立WebSocket网关层 | 连接集中管理 | 架构复杂，单点风险 | 大规模，专业团队 |
+| 一致性哈希 | 用户分配到特定实例 | 负载均匀，动态扩展 | 实现复杂，重连成本 | 大规模，高可用要求 |
+
+**选择方案**: **粘性会话 + Redis广播**
+- 与现有Spring Boot + Redis技术栈完美匹配
+- 实现复杂度低，可快速上线
+- 支持渐进式升级到更复杂架构
+
+#### 12.2 WebSocket技术实现方案
+
+**问题**: 选择合适的WebSocket实现技术，平衡性能、开发效率和维护成本。
+
+**详细方案对比**:
+
+##### 方案1: Spring WebSocket + STOMP
+```java
+/**
+ * Spring WebSocket配置
+ */
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+    
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        config.enableSimpleBroker("/topic", "/queue");
+        config.setApplicationDestinationPrefixes("/app");
+        config.setUserDestinationPrefix("/user");
+    }
+    
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws/im")
+                .setAllowedOriginPatterns("*")
+                .withSockJS();
+    }
+}
+```
+
+**优点**:
+- 与Spring Boot无缝集成
+- STOMP协议标准化，客户端支持好
+- 开发效率高，学习成本低
+- 内置SockJS降级支持
+- 支持集群部署（通过消息代理）
+
+**缺点**:
+- 性能相对较低
+- 内存占用较大
+- 连接数限制相对较低（约1-2万）
+- 定制化能力有限
+
+**适用场景**: 中小规模应用，快速开发
+
+##### 方案2: Netty + 自定义协议
+```java
+/**
+ * Netty WebSocket服务器
+ */
+@Component
+public class NettyWebSocketServer {
+    
+    private EventLoopGroup bossGroup;
+    private EventLoopGroup workerGroup;
+    
+    public void start() throws InterruptedException {
+        bossGroup = new NioEventLoopGroup(1);
+        workerGroup = new NioEventLoopGroup();
+        
+        ServerBootstrap bootstrap = new ServerBootstrap();
+        bootstrap.group(bossGroup, workerGroup)
+                .channel(NioServerSocketChannel.class)
+                .childHandler(new WebSocketChannelInitializer());
+    }
+}
+```
+
+**优点**:
+- 性能极高，支持10万+并发连接
+- 内存使用效率高
+- 完全可定制化
+- 支持各种协议扩展
+- 适合大规模部署
+
+**缺点**:
+- 开发复杂度高
+- 学习成本大
+- 需要处理更多底层细节
+- 调试和维护困难
+- 与Spring集成需要额外工作
+
+**适用场景**: 大规模应用，性能要求极高
+
+##### 方案3: Spring WebFlux + Reactive WebSocket
+```java
+/**
+ * WebFlux WebSocket配置
+ */
+@Configuration
+public class WebFluxWebSocketConfig {
+    
+    @Bean
+    public HandlerMapping webSocketMapping() {
+        Map<String, WebSocketHandler> map = new HashMap<>();
+        map.put("/ws/im", new IMWebSocketHandler());
+        
+        SimpleUrlHandlerMapping mapping = new SimpleUrlHandlerMapping();
+        mapping.setUrlMap(map);
+        mapping.setOrder(1);
+        return mapping;
+    }
+}
+```
+
+**优点**:
+- 响应式编程模型
+- 更好的资源利用率
+- 支持背压处理
+- 与Spring生态集成好
+- 适合高并发场景
+
+**缺点**:
+- 学习曲线陡峭
+- 调试复杂
+- 生态相对不成熟
+- 开发效率相对较低
+
+**适用场景**: 高并发，响应式架构
+
+##### 方案4: 混合架构（推荐）
+```java
+/**
+ * 混合架构设计
+ */
+public class HybridWebSocketArchitecture {
+    
+    // 阶段1: Spring WebSocket快速上线
+    @ConditionalOnProperty(name = "websocket.mode", havingValue = "spring")
+    @Configuration
+    static class SpringWebSocketConfig {
+        // Spring WebSocket配置
+    }
+    
+    // 阶段2: Netty高性能升级
+    @ConditionalOnProperty(name = "websocket.mode", havingValue = "netty")
+    @Configuration
+    static class NettyWebSocketConfig {
+        // Netty配置
+    }
+}
+```
+
+**优点**:
+- 渐进式演进，风险可控
+- 初期快速上线，后期性能优化
+- 技术栈平滑过渡
+- 支持A/B测试
+
+**缺点**:
+- 需要维护两套代码
+- 架构复杂度增加
+
+**选择方案**: **混合架构（Spring WebSocket → Netty）**
+- 初期使用Spring WebSocket快速上线
+- 后期根据性能需求升级到Netty
+- 平衡开发效率和性能要求
+
+#### 12.3 多客户端连接优化方案
+
+**问题**: 同一用户在多个客户端（Web、移动端、桌面端）同时在线时的连接管理。
+
+**方案设计**:
+
+##### 连接复用策略
+```java
+/**
+ * 用户连接管理器
+ */
+@Service
+public class UserConnectionManager {
+    
+    // 用户多连接映射 userId -> List<ConnectionInfo>
+    private final Map<String, List<ConnectionInfo>> userConnections = new ConcurrentHashMap<>();
+    
+    /**
+     * 用户连接信息
+     */
+    public static class ConnectionInfo {
+        private String connectionId;     // 连接唯一标识
+        private String deviceType;      // 设备类型：web/mobile/desktop
+        private String deviceId;        // 设备唯一标识
+        private Long lastActiveTime;    // 最后活跃时间
+        private WebSocketSession session; // WebSocket会话
+    }
+    
+    /**
+     * 智能消息推送
+     */
+    public void pushMessage(String userId, MessageDTO message) {
+        List<ConnectionInfo> connections = userConnections.get(userId);
+        if (connections == null || connections.isEmpty()) {
+            // 用户离线，存储离线消息
+            offlineMessageService.store(userId, message);
+            return;
+        }
+        
+        // 根据消息类型和设备特性选择推送策略
+        if (message.isUrgent()) {
+            // 紧急消息推送到所有设备
+            connections.forEach(conn -> sendToConnection(conn, message));
+        } else {
+            // 普通消息推送到最活跃设备
+            ConnectionInfo activeConnection = findMostActiveConnection(connections);
+            sendToConnection(activeConnection, message);
+        }
+    }
+}
+```
+
+##### 连接去重策略
+```java
+/**
+ * 连接去重配置
+ */
+@ConfigurationProperties(prefix = "websocket.connection")
+@Data
+public class ConnectionDeduplicationConfig {
+    
+    /**
+     * 同设备最大连接数
+     */
+    private int maxConnectionsPerDevice = 1;
+    
+    /**
+     * 同用户最大连接数
+     */
+    private int maxConnectionsPerUser = 5;
+    
+    /**
+     * 连接超时时间（秒）
+     */
+    private int connectionTimeoutSeconds = 300;
+    
+    /**
+     * 心跳间隔（秒）
+     */
+    private int heartbeatIntervalSeconds = 30;
+}
+```
+
+#### 12.4 大规模连接数优化方案
+
+**问题**: 当用户量增长到10万+时，如何保证服务端连接数不过多占用资源。
+
+**优化策略**:
+
+##### 分层连接管理
+```mermaid
+graph TD
+    subgraph "连接分层架构"
+        L1[一级连接池<br>活跃用户<br>1万连接]
+        L2[二级连接池<br>普通用户<br>5万连接]
+        L3[三级连接池<br>低活跃用户<br>长连接保持]
+    end
+    
+    subgraph "连接策略"
+        S1[实时连接<br>高频交互用户]
+        S2[准实时连接<br>中频交互用户]
+        S3[轮询连接<br>低频交互用户]
+    end
+    
+    L1 --> S1
+    L2 --> S2
+    L3 --> S3
+```
+
+##### 连接池配置优化
+```java
+/**
+ * 连接池优化配置
+ */
+@Configuration
+public class WebSocketOptimizationConfig {
+    
+    /**
+     * Netty连接池配置
+     */
+    @Bean
+    public NettyChannelPoolConfig channelPoolConfig() {
+        return NettyChannelPoolConfig.builder()
+                .maxConnections(100000)           // 最大连接数
+                .maxPendingAcquires(10000)        // 最大等待连接数
+                .acquireTimeoutMillis(5000)       // 连接获取超时
+                .maxIdleTime(Duration.ofMinutes(10)) // 最大空闲时间
+                .healthCheckInterval(Duration.ofSeconds(30)) // 健康检查间隔
+                .build();
+    }
+    
+    /**
+     * JVM优化参数
+     */
+    @PostConstruct
+    public void optimizeJVM() {
+        // 设置JVM参数
+        System.setProperty("io.netty.allocator.maxOrder", "9");
+        System.setProperty("io.netty.allocator.numDirectArenas", "2");
+        System.setProperty("io.netty.allocator.numHeapArenas", "2");
+    }
+}
+```
+
+##### 智能降级策略
+```java
+/**
+ * 连接降级策略
+ */
+@Component
+public class ConnectionDegradationStrategy {
+    
+    private final AtomicInteger currentConnections = new AtomicInteger(0);
+    private final int maxConnections = 80000; // 最大连接数阈值
+    
+    /**
+     * 连接准入控制
+     */
+    public boolean allowNewConnection(String userId, String deviceType) {
+        int current = currentConnections.get();
+        
+        if (current >= maxConnections) {
+            // 达到最大连接数，执行降级策略
+            return executeDegradationStrategy(userId, deviceType);
+        }
+        
+        return true;
+    }
+    
+    private boolean executeDegradationStrategy(String userId, String deviceType) {
+        // 策略1: 踢出最久未活跃的连接
+        ConnectionInfo oldestInactive = findOldestInactiveConnection();
+        if (oldestInactive != null) {
+            closeConnection(oldestInactive);
+            return true;
+        }
+        
+        // 策略2: 限制低优先级设备连接
+        if ("desktop".equals(deviceType)) {
+            return false; // 拒绝桌面端连接
+        }
+        
+        // 策略3: VIP用户优先
+        if (isVipUser(userId)) {
+            ConnectionInfo normalUserConnection = findNormalUserConnection();
+            if (normalUserConnection != null) {
+                closeConnection(normalUserConnection);
+                return true;
+            }
+        }
+        
+        return false;
+    }
+}
+```
+
+#### 12.5 消息路由架构
+
+**选择方案**: **消息队列路由 + 异步处理**
+
+```mermaid
+graph TD
+    subgraph "消息发送流程"
+        A[消息发送] --> B[消息验证]
+        B --> C[存储到数据库]
+        C --> D[发送到MQ]
+    end
+    
+    subgraph "消息路由处理"
+        D --> E[单聊队列]
+        D --> F[群聊队列]
+        D --> G[系统通知队列]
+    end
+    
+    subgraph "消息推送"
+        E --> H[在线用户推送]
+        F --> I[群成员推送]
+        G --> J[系统广播]
+        
+        H --> K[离线消息存储]
+        I --> K
+        J --> K
+    end
+```
+
+#### 12.6 会话状态管理
+
+**选择方案**: **Redis集中式状态管理**
+
+```java
+/**
+ * 会话状态管理
+ */
+@Service
+public class ConversationStateManager {
+    
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    
+    private static final String USER_ONLINE_KEY = "user:online:";
+    private static final String CONVERSATION_MEMBERS_KEY = "conversation:members:";
+    private static final String USER_CONVERSATIONS_KEY = "user:conversations:";
+    
+    /**
+     * 用户上线
+     */
+    public void userOnline(String userId, String connectionId) {
+        String key = USER_ONLINE_KEY + userId;
+        redisTemplate.opsForHash().put(key, "connectionId", connectionId);
+        redisTemplate.opsForHash().put(key, "onlineTime", System.currentTimeMillis());
+        redisTemplate.expire(key, Duration.ofHours(24));
+    }
+    
+    /**
+     * 获取会话在线成员
+     */
+    public List<String> getOnlineMembers(String conversationId) {
+        String key = CONVERSATION_MEMBERS_KEY + conversationId;
+        Set<String> members = redisTemplate.opsForSet().members(key);
+        
+        return members.stream()
+                .filter(this::isUserOnline)
+                .collect(Collectors.toList());
+    }
+}
+```
+
+#### 12.7 消息持久化架构
+
+**选择方案**: **渐进式演进（单表→时间分片）**
+
+**阶段1: 单表存储**
+```sql
+-- 扩展现有消息表
+ALTER TABLE t_msg_body ADD COLUMN conversation_id VARCHAR(50);
+ALTER TABLE t_msg_body ADD COLUMN message_format INT DEFAULT 0;
+ALTER TABLE t_msg_body ADD INDEX idx_conversation_time (conversation_id, create_time);
+```
+
+**阶段2: 时间分片**
+```sql
+-- 按月分表
+CREATE TABLE t_msg_body_202401 LIKE t_msg_body;
+CREATE TABLE t_msg_body_202402 LIKE t_msg_body;
+-- 自动分表逻辑
+```
+
+### 技术栈选择
+
 | 技术分类 | 选型 | 版本 | 说明 |
 |---------|------|------|------|
 | Web框架 | Spring Boot | 2.3.12 | 与现有项目保持一致 |
-| 实时通信 | WebSocket + STOMP | - | 基于标准协议，支持集群 |
-| 消息队列 | RocketMQ | 4.9.x | 现有技术栈，支持顺序消息 |
-| 缓存 | Redis | 6.x | 在线状态、会话缓存 |
+| WebSocket | Spring WebSocket → Netty | - | 渐进式升级 |
+| 消息队列 | RocketMQ | 4.9.x | 现有技术栈 |
+| 缓存 | Redis | 6.x | 状态管理、会话缓存 |
 | 数据库 | MySQL | 8.0 | 兼容现有数据库 |
-| JSON处理 | Jackson | 2.11.x | Spring Boot默认 |
+| 连接池 | HikariCP | 3.4.x | 高性能连接池 |
 
-### 依赖管理
-```xml
-<!-- WebSocket支持 -->
-<dependency>
-    <groupId>org.springframework</groupId>
-    <artifactId>spring-websocket</artifactId>
-</dependency>
-<dependency>
-    <groupId>org.springframework</groupId>
-    <artifactId>spring-messaging</artifactId>
-</dependency>
+### 性能指标目标
 
-<!-- STOMP协议支持 -->
-<dependency>
-    <groupId>org.springframework</groupId>
-    <artifactId>spring-webmvc</artifactId>
-</dependency>
-
-<!-- RocketMQ -->
-<dependency>
-    <groupId>org.apache.rocketmq</groupId>
-    <artifactId>rocketmq-spring-boot-starter</artifactId>
-    <version>2.2.1</version>
-</dependency>
-
-<!-- Redis -->
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-data-redis</artifactId>
-</dependency>
-```
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 并发连接数 | 10万+ | 支持大规模用户同时在线 |
+| 消息延迟 | <100ms | 消息发送到接收的延迟 |
+| 消息吞吐量 | 10万条/秒 | 系统消息处理能力 |
+| 可用性 | 99.9% | 系统稳定性要求 |
+| 响应时间 | <200ms | API接口响应时间 |
 
 ## 13. 接口定义
 
