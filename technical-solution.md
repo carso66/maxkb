@@ -57,6 +57,62 @@ CONVERSATION(0, "会话"), // 兼容字段，relatingBizType为会话时使用
 
 ## 4. 领域模型
 
+### 单聊与群聊表设计决策分析
+
+#### 需求分析对比
+| 维度 | 单聊 | 群聊 | 共同点 |
+|------|------|------|--------|
+| **成员数量** | 固定2人 | 3人以上，动态变化 | 都有参与者概念 |
+| **成员管理** | 无需管理，天然存在 | 需要邀请/移除机制 | 都需要成员状态 |
+| **权限模型** | 无权限概念，平等 | 有群主/管理员/成员角色 | 都需要操作验证 |
+| **未读管理** | 直接在会话表记录 | 每个成员独立记录 | 都需要未读计数 |
+| **会话特性** | 不可解散，可删除 | 可解散，可退出 | 都有生命周期 |
+| **业务规则** | 简单，无复杂逻辑 | 复杂，多种业务场景 | 都是消息容器 |
+
+#### 表设计方案对比
+
+##### 方案A：合并表设计（推荐✅）
+**优势**：
+- **业务一致性**：用户看到统一的会话列表，符合业务模型
+- **查询性能**：单SQL查询用户所有会话，性能更优
+- **扩展性强**：新增会话类型（系统通知、客服）只需增加type
+- **开发维护**：Repository层统一，减少重复代码
+- **行业标准**：微信、钉钉等主流IM都采用类似设计
+
+**劣势**：
+- 存在字段冗余（单聊不需要max_member_count等）
+- Service层需要处理type分支逻辑
+
+**解决方案**：
+```sql
+-- 通过数据库约束和默认值处理冗余字段
+ALTER TABLE t_conversation ADD CONSTRAINT check_private_chat 
+CHECK (
+  (conversation_type = 'private' AND max_member_count = 2 AND current_member_count = 2)
+  OR 
+  (conversation_type != 'private')
+);
+```
+
+##### 方案B：分离表设计
+**优势**：
+- 表结构精确，无字段冗余
+- 单聊性能极致优化
+- 逻辑分离清晰
+
+**劣势**：
+- **查询复杂**：`UNION`查询性能差，分页困难
+- **ID冲突**：需要全局ID生成策略
+- **扩展困难**：新增类型需要新表
+- **维护成本**：两套Repository和Service
+
+#### 最终决策：采用合并表设计
+
+**参考资料**：
+- [微信架构设计](https://www.infoq.cn/article/the-road-of-the-growth-weixin-background)
+- [IM系统设计最佳实践](https://www.cnblogs.com/flashsun/p/14318928.html)
+- [大规模IM系统架构设计](https://tech.meituan.com/2018/11/15/dianping-im-arch.html)
+
 ### 数据库表设计说明
 
 #### 新增表
@@ -105,6 +161,7 @@ CONVERSATION(0, "会话"), // 兼容字段，relatingBizType为会话时使用
 ```java
 /**
  * 会话聚合根
+ * 统一管理单聊和群聊，通过conversation_type区分
  */
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -121,9 +178,9 @@ public class Conversation extends BaseEntity {
     private Long lastMessageId;              // 最后一条消息ID
     private Long lastActiveTime;             // 最后活跃时间
     private Integer currentMemberCount;      // 当前成员数量
-    private Integer maxMemberCount;          // 最大成员数量
+    private Integer maxMemberCount;          // 最大成员数量（单聊固定为2）
     
-    // 单聊专用字段
+    // 单聊专用字段（通过type区分使用）
     private MessageUser firstIdentity;       // 第一个身份信息（值对象）
     private MessageUser secondIdentity;      // 第二个身份信息（值对象）
     private Long firstIdentityUnreadCount;   // 第一个身份未读数
@@ -380,551 +437,6 @@ public class MessageReadEvent extends BaseDomainEvent {
 ```java
 public class ConversationDomainService {
     
-    private static final String CONVERSATION_INSERT_LOCK_PREFIX = "CONVERSATION_INSERT_";
-    private static final String CONVERSATION_UPDATE_LOCK_PREFIX = "CONVERSATION_UPDATE_";
-    
-    /**
-     * 生成会话唯一标识
-     */
-    public static String generateConversationKey(ConversationType type, String... memberIds) {
-        switch (type.getType()) {
-            case "private":
-                // 单聊：private_min(id1,id2)_max(id1,id2)
-                List<String> sortedIds = Arrays.stream(memberIds).sorted().collect(Collectors.toList());
-                return String.format("private_%s_%s", sortedIds.get(0), sortedIds.get(1));
-            case "group":
-                // 群聊：group_随机UUID
-                return "group_" + UUID.randomUUID().toString().replace("-", "");
-            case "system":
-                // 系统通知：system_{identity_id}
-                return "system_" + memberIds[0];
-            case "assistant":
-                // 平台客服：assistant_{identity_id}
-                return "assistant_" + memberIds[0];
-            default:
-                throw new IllegalArgumentException("Unknown conversation type: " + type.getType());
-        }
-    }
-    
-    /**
-     * 验证成员数量限制
-     */
-    public static void validateMemberCount(Conversation conversation, int newMemberCount) {
-        AssertUtil.that(conversation != null, BasicErrorCode.PARAM_ERROR, "conversation null");
-        AssertUtil.that(newMemberCount <= conversation.getMaxMemberCount(), 
-                        BasicErrorCode.BUSINESS_ERROR, "超过最大成员数量限制");
-    }
-    
-    /**
-     * 验证用户是否有权限操作会话
-     */
-    public static void validateOperationPermission(Conversation conversation, String operatorId, String permission) {
-        AssertUtil.that(conversation != null, BasicErrorCode.PARAM_ERROR, "conversation null");
-        
-        ConversationMember operator = conversation.getMemberList().stream()
-                .filter(member -> operatorId.equals(member.getMemberUser().getIdentityId()))
-                .findFirst()
-                .orElse(null);
-        
-        AssertUtil.that(operator != null, BasicErrorCode.PERMISSION_DENIED, "用户不在会话中");
-        AssertUtil.that(operator.getMemberRole().getPermissions().contains(permission), 
-                        BasicErrorCode.PERMISSION_DENIED, "权限不足");
-    }
-    
-    /**
-     * 计算单聊未读数量
-     */
-    public static void calculatePrivateChatUnreadCount(Conversation conversation, String identityId) {
-        if (!"private".equals(conversation.getConversationType().getType())) {
-            return;
-        }
-        
-        // 根据身份ID判断是第一个还是第二个身份
-        if (conversation.getFirstIdentity().getIdentityId().equals(identityId)) {
-            // 计算第一个身份的未读数
-            // 这里需要调用Repository查询未读消息数量
-        } else if (conversation.getSecondIdentity().getIdentityId().equals(identityId)) {
-            // 计算第二个身份的未读数
-        }
-    }
-    
-    /**
-     * 获取分布式锁键 - 插入操作
-     */
-    public static String getDistributedLockKeyForInsert(String conversationKey) {
-        return UniqueKeyUtil.generateUniqueKey(CONVERSATION_INSERT_LOCK_PREFIX, conversationKey);
-    }
-    
-    /**
-     * 获取分布式锁键 - 更新操作
-     */
-    public static String getDistributedLockKeyForUpdate(Long conversationId) {
-        return UniqueKeyUtil.generateUniqueKey(CONVERSATION_UPDATE_LOCK_PREFIX, conversationId);
-    }
-}
-```
-
-#### 2. MessageDomainService（消息领域服务 - 扩展现有）
-```java
-public class MessageDomainService {
-    
-    // ... 现有方法保持不变
-    
-    /**
-     * 判断是否为IM消息
-     */
-    public static boolean isIMMessage(Message message) {
-        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
-        
-        Integer relatingBizType = message.getMessageBody().getRelatingBizType();
-        return relatingBizType != null && (relatingBizType == 19 || relatingBizType == 20 || relatingBizType == 21);
-    }
-    
-    /**
-     * 判断是否为业务消息
-     */
-    public static boolean isBusinessMessage(Message message) {
-        return !isIMMessage(message);
-    }
-    
-    /**
-     * 撤回消息
-     */
-    public static void recallMessage(Message message, String operatorId) {
-        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
-        AssertUtil.that(!message.getIsRecalled(), BasicErrorCode.BUSINESS_ERROR, "消息已撤回");
-        
-        // 验证撤回权限（只有发送者可以撤回，或者管理员）
-        String senderId = message.getSender().getSenderUser().getIdentityId();
-        AssertUtil.that(senderId.equals(operatorId), BasicErrorCode.PERMISSION_DENIED, "只能撤回自己的消息");
-        
-        // 验证撤回时间限制（比如2分钟内）
-        long currentTime = System.currentTimeMillis();
-        long sendTime = message.getCreateTime();
-        long timeDiff = currentTime - sendTime;
-        AssertUtil.that(timeDiff <= 2 * 60 * 1000, BasicErrorCode.BUSINESS_ERROR, "超过撤回时间限制");
-        
-        message.setIsRecalled(true);
-        message.setRecallTime(currentTime);
-    }
-    
-    /**
-     * 验证消息格式
-     */
-    public static void validateMessageFormat(Message message) {
-        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
-        
-        MessageFormat format = message.getMessageFormat();
-        if (format == null) {
-            return;
-        }
-        
-        // 验证文件大小限制
-        if (message.getFileSize() != null && message.getFileSize() > format.getMaxSize()) {
-            throw new BusinessException(BasicErrorCode.BUSINESS_ERROR, "文件大小超过限制");
-        }
-        
-        // 验证内容长度
-        String content = message.getMessageBody().getContent();
-        if (format.getFormat() == 0 && content != null && content.length() > format.getMaxSize()) {
-            throw new BusinessException(BasicErrorCode.BUSINESS_ERROR, "文本内容过长");
-        }
-    }
-    
-    /**
-     * 填充会话相关信息
-     */
-    public static void fillConversationInfo(Message message, Conversation conversation) {
-        AssertUtil.that(message != null, BasicErrorCode.PARAM_ERROR, "message null");
-        AssertUtil.that(conversation != null, BasicErrorCode.PARAM_ERROR, "conversation null");
-        
-        message.setConversationId(conversation.getConversationId().toString());
-        message.getMessageBody().setConversationId(conversation.getConversationId().toString());
-    }
-}
-```
-
-#### 3. ConversationMemberDomainService（会话成员领域服务）
-```java
-public class ConversationMemberDomainService {
-    
-    /**
-     * 更新成员角色
-     */
-    public static void updateMemberRole(ConversationMember member, MemberRole newRole, String operatorId) {
-        AssertUtil.that(member != null, BasicErrorCode.PARAM_ERROR, "member null");
-        AssertUtil.that(newRole != null, BasicErrorCode.PARAM_ERROR, "newRole null");
-        
-        // 验证操作权限（只有群主可以设置管理员，管理员和群主可以设置普通成员）
-        MemberRole operatorRole = getCurrentMemberRole(member.getConversationId(), operatorId);
-        validateRoleChangePermission(operatorRole, member.getMemberRole(), newRole);
-        
-        member.setMemberRole(newRole);
-    }
-    
-    /**
-     * 成员退出会话
-     */
-    public static void exitConversation(ConversationMember member) {
-        AssertUtil.that(member != null, BasicErrorCode.PARAM_ERROR, "member null");
-        AssertUtil.that(MemberStatus.ACTIVE.equals(member.getMemberStatus().getStatus()), 
-                        BasicErrorCode.BUSINESS_ERROR, "成员状态异常");
-        
-        member.setMemberStatus(MemberStatus.exited());
-        member.setExitTime(System.currentTimeMillis());
-    }
-    
-    /**
-     * 更新最后已读消息
-     */
-    public static void updateLastReadMessage(ConversationMember member, Long messageId) {
-        AssertUtil.that(member != null, BasicErrorCode.PARAM_ERROR, "member null");
-        AssertUtil.that(messageId != null, BasicErrorCode.PARAM_ERROR, "messageId null");
-        
-        // 验证消息ID有效性
-        if (member.getLastReadMessageId() != null && messageId <= member.getLastReadMessageId()) {
-            return; // 不能回退已读位置
-        }
-        
-        member.setLastReadMessageId(messageId);
-        // 未读数的重新计算在Repository层处理
-    }
-    
-    /**
-     * 计算群聊未读数量
-     */
-    public static Long calculateGroupUnreadCount(ConversationMember member, Long totalMessageCount) {
-        if (member.getLastReadMessageId() == null) {
-            return totalMessageCount;
-        }
-        // 具体计算逻辑在Repository层实现
-        return 0L;
-    }
-    
-    private static MemberRole getCurrentMemberRole(Long conversationId, String identityId) {
-        // 这里需要调用Repository查询当前用户在会话中的角色
-        // 为了示例，返回普通成员角色
-        return MemberRole.member();
-    }
-    
-    private static void validateRoleChangePermission(MemberRole operatorRole, MemberRole currentRole, MemberRole newRole) {
-        // 验证角色变更权限的具体逻辑
-        // 群主可以设置任何角色，管理员只能设置普通成员
-    }
-}
-```
-
-## 5. 时序图
-
-### 单聊发送消息时序图
-```mermaid
-sequenceDiagram
-    participant Client as 客户端
-    participant Controller as IMController
-    participant CmdFacade as MessageCmdFacade
-    participant DomainFacade as MessageDomainFacade
-    participant ConvDomainFacade as ConversationDomainFacade
-    participant Repository as MessageRepository
-    participant WebSocket as WebSocketHandler
-    
-    Client->>Controller: 发送私聊消息
-    Controller->>CmdFacade: sendPrivateMessage(request)
-    CmdFacade->>DomainFacade: send(message)
-    DomainFacade->>ConvDomainFacade: getOrCreatePrivateConversation()
-    ConvDomainFacade->>Repository: 查询/创建会话
-    DomainFacade->>Repository: 保存消息
-    DomainFacade->>WebSocket: 推送消息给在线用户
-    DomainFacade-->>Controller: 返回结果
-    Controller-->>Client: 返回成功
-```
-
-### 群聊创建时序图
-```mermaid
-sequenceDiagram
-    participant Client as 客户端
-    participant Controller as IMController
-    participant CmdFacade as ConversationCmdFacade
-    participant DomainFacade as ConversationDomainFacade
-    participant Repository as ConversationRepository
-    participant EventBus as 事件总线
-    
-    Client->>Controller: 创建群聊
-    Controller->>CmdFacade: createGroupConversation(request)
-    CmdFacade->>DomainFacade: createGroup(conversation, memberList)
-    DomainFacade->>Repository: 保存群聊会话
-    DomainFacade->>Repository: 保存会话成员
-    DomainFacade->>EventBus: 发布会话创建事件
-    DomainFacade-->>Controller: 返回群聊信息
-    Controller-->>Client: 返回成功
-```
-
-## 6. 应用服务层
-
-### Facade接口设计
-
-#### ConversationCmdFacade（会话命令门面）
-```java
-/**
- * 会话命令门面
- */
-public interface ConversationCmdFacade {
-    
-    /**
-     * 创建单聊会话
-     */
-    ConversationDTO createPrivateConversation(CreatePrivateConversationRequest request);
-    
-    /**
-     * 创建群聊会话
-     */
-    ConversationDTO createGroupConversation(CreateGroupConversationRequest request);
-    
-    /**
-     * 邀请成员加入群聊
-     */
-    boolean inviteMembersToGroup(InviteMembersRequest request);
-    
-    /**
-     * 移除群聊成员
-     */
-    boolean removeMemberFromGroup(RemoveMemberRequest request);
-    
-    /**
-     * 更新会话设置
-     */
-    boolean updateConversationSetting(UpdateConversationSettingRequest request);
-    
-    /**
-     * 解散群聊
-     */
-    boolean dissolveGroup(DissolveGroupRequest request);
-    
-    /**
-     * 退出群聊
-     */
-    boolean exitGroup(ExitGroupRequest request);
-}
-```
-
-#### ConversationQueryFacade（会话查询门面）
-```java
-/**
- * 会话查询门面
- */
-public interface ConversationQueryFacade {
-    
-    /**
-     * 分页查询用户会话列表
-     */
-    PageList<ConversationDTO> pageUserConversations(QueryUserConversationsParam param, PageParam pageParam);
-    
-    /**
-     * 查询会话详情
-     */
-    ConversationDTO getConversationDetail(QueryConversationDetailParam param);
-    
-    /**
-     * 查询会话成员列表
-     */
-    List<ConversationMemberDTO> getConversationMembers(QueryConversationMembersParam param);
-    
-    /**
-     * 查询用户在会话中的角色和权限
-     */
-    ConversationMemberDTO getUserRoleInConversation(QueryUserRoleParam param);
-    
-    /**
-     * 查询会话消息历史
-     */
-    PageList<MessageDTO> pageConversationMessages(QueryConversationMessagesParam param, PageParam pageParam);
-}
-```
-
-#### MessageCmdFacade（消息命令门面 - 扩展现有）
-```java
-/**
- * 消息命令门面 - 扩展现有
- */
-public interface MessageCmdFacade {
-    
-    // 现有方法保持不变
-    
-    /**
-     * 发送IM私聊消息
-     */
-    MessageDTO sendPrivateMessage(SendPrivateMessageRequest request);
-    
-    /**
-     * 发送IM群聊消息
-     */
-    MessageDTO sendGroupMessage(SendGroupMessageRequest request);
-    
-    /**
-     * 撤回消息
-     */
-    boolean recallMessage(RecallMessageRequest request);
-    
-    /**
-     * 转发消息
-     */
-    MessageDTO forwardMessage(ForwardMessageRequest request);
-    
-    /**
-     * 标记消息已读
-     */
-    boolean markMessageRead(MarkMessageReadRequest request);
-    
-    /**
-     * 批量标记会话消息已读
-     */
-    boolean markConversationRead(MarkConversationReadRequest request);
-}
-```
-
-#### MessageQueryFacade（消息查询门面 - 扩展现有）
-```java
-/**
- * 消息查询门面 - 扩展现有
- */
-public interface MessageQueryFacade {
-    
-    // 现有方法保持不变
-    
-    /**
-     * 查询IM消息列表
-     */
-    PageList<MessageDTO> pageIMMessages(QueryIMMessagesParam param, PageParam pageParam);
-    
-    /**
-     * 查询会话中的消息
-     */
-    PageList<MessageDTO> pageConversationMessages(QueryConversationMessagesParam param, PageParam pageParam);
-    
-    /**
-     * 查询消息详情（包含回复信息）
-     */
-    MessageDetailDTO getMessageDetail(QueryMessageDetailParam param);
-    
-    /**
-     * 搜索消息内容
-     */
-    PageList<MessageDTO> searchMessages(SearchMessagesParam param, PageParam pageParam);
-    
-    /**
-     * 查询用户未读消息统计
-     */
-    UnreadStatisticDTO getUnreadStatistic(QueryUnreadStatisticParam param);
-}
-```
-
-### DomainFacade接口设计
-
-#### ConversationDomainFacade（会话领域门面）
-```java
-/**
- * 会话领域门面
- */
-public interface ConversationDomainFacade {
-    
-    /**
-     * 获取或创建单聊会话
-     */
-    Conversation getOrCreatePrivateConversation(String firstIdentityId, String secondIdentityId);
-    
-    /**
-     * 创建群聊会话
-     */
-    Conversation createGroupConversation(Conversation conversation, List<ConversationMember> members);
-    
-    /**
-     * 添加会话成员
-     */
-    boolean addMember(Long conversationId, ConversationMember member);
-    
-    /**
-     * 移除会话成员
-     */
-    boolean removeMember(Long conversationId, String memberId, String operatorId);
-    
-    /**
-     * 更新最后消息信息
-     */
-    boolean updateLastMessage(Long conversationId, Long messageId, Long activeTime);
-    
-    /**
-     * 解散会话
-     */
-    boolean dissolveConversation(Long conversationId, String operatorId);
-    
-    /**
-     * 更新会话设置
-     */
-    boolean updateSetting(Long conversationId, ConversationSetting setting);
-    
-    /**
-     * 查询会话详情
-     */
-    Conversation getById(Long conversationId);
-    
-    /**
-     * 查询用户会话列表
-     */
-    List<Conversation> getUserConversations(String identityId);
-    
-    /**
-     * 通过会话key查询
-     */
-    Conversation getByConversationKey(String conversationKey);
-}
-```
-
-#### MessageDomainFacade（消息领域门面 - 扩展现有）
-```java
-/**
- * 消息领域门面 - 扩展现有
- */
-public interface MessageDomainFacade {
-    
-    // 现有方法保持不变
-    
-    /**
-     * 发送IM消息
-     */
-    boolean sendIMMessage(Message message);
-    
-    /**
-     * 撤回消息
-     */
-    boolean recallMessage(Long messageId, String operatorId);
-    
-    /**
-     * 查询会话消息
-     */
-    PageList<Message> pageConversationMessages(String conversationId, PageParam pageParam);
-    
-    /**
-     * 更新消息状态
-     */
-    boolean updateMessageStatus(Long messageId, Integer status);
-    
-    /**
-     * 查询IM消息列表
-     */
-    List<Message> getIMMessages(QueryIMMessagesParam param);
-}
-```
-
-## 7. 领域服务层
-
-### DomainService设计
-
-#### ConversationDomainService（会话领域服务）
-```java
-/**
- * 会话领域服务
- */
-public class ConversationDomainService {
-    
     /**
      * 生成会话唯一标识
      */
@@ -946,22 +458,14 @@ public class ConversationDomainService {
     public static void calculatePrivateChatUnreadCount(Conversation conversation, String identityId);
     
     /**
-     * 获取分布式锁键 - 插入操作
+     * 获取分布式锁键
      */
-    public static String getDistributedLockKeyForInsert(String conversationKey);
-    
-    /**
-     * 获取分布式锁键 - 更新操作
-     */
-    public static String getDistributedLockKeyForUpdate(Long conversationId);
+    public static String getDistributedLockKey(String conversationKey);
 }
 ```
 
-#### MessageDomainService（消息领域服务 - 扩展现有）
+#### 2. MessageDomainService（消息领域服务 - 扩展现有）
 ```java
-/**
- * 消息领域服务 - 扩展现有
- */
 public class MessageDomainService {
     
     // 现有方法保持不变
@@ -970,11 +474,6 @@ public class MessageDomainService {
      * 判断是否为IM消息
      */
     public static boolean isIMMessage(Message message);
-    
-    /**
-     * 判断是否为业务消息
-     */
-    public static boolean isBusinessMessage(Message message);
     
     /**
      * 撤回消息
@@ -993,11 +492,8 @@ public class MessageDomainService {
 }
 ```
 
-#### ConversationMemberDomainService（会话成员领域服务）
+#### 3. ConversationMemberDomainService（会话成员领域服务）
 ```java
-/**
- * 会话成员领域服务
- */
 public class ConversationMemberDomainService {
     
     /**
@@ -1021,6 +517,8 @@ public class ConversationMemberDomainService {
     public static Long calculateGroupUnreadCount(ConversationMember member, Long totalMessageCount);
 }
 ```
+
+**详细实现请参考第7章"领域服务层"。**
 
 ### DomainStatusFacade设计
 
@@ -2530,38 +2028,206 @@ graph TB
 
 ## 16. QA
 
-### 性能优化
-1. **消息分页加载**：会话消息按页加载，默认20条/页
-2. **缓存策略**：用户在线状态、活跃会话列表缓存到Redis
-3. **数据库优化**：合理建立索引，读写分离
-4. **WebSocket连接管理**：连接池管理，心跳检测
+### 质量保证体系
 
-### 安全性考虑
-1. **权限验证**：接口层和WebSocket层双重权限验证
-2. **消息过滤**：敏感词过滤，防止恶意内容
-3. **频率限制**：消息发送频率限制，防止刷屏
-4. **数据加密**：传输层TLS加密，敏感数据脱敏
+#### 16.1 性能优化策略
 
-### 可扩展性设计
-1. **水平扩展**：无状态设计，支持集群部署
-2. **消息持久化**：RocketMQ保证消息可靠性
-3. **存储扩展**：支持分库分表，文件存储可扩展
-4. **协议扩展**：基于STOMP标准协议，易于扩展
+##### 数据库性能优化
+| 优化项 | 具体措施 | 预期效果 | 监控指标 |
+|--------|----------|----------|----------|
+| **索引优化** | 会话表按用户ID、类型、活跃时间建索引 | 查询时间<50ms | 慢查询日志 |
+| **分页查询** | 消息分页加载，默认20条/页 | 减少内存占用 | 响应时间 |
+| **读写分离** | 查询走从库，写入走主库 | 提升并发能力 | QPS统计 |
+| **连接池** | 数据库连接池大小优化 | 减少连接创建开销 | 连接数监控 |
 
-### 容错处理
-1. **消息重试**：发送失败自动重试机制
-2. **离线消息**：用户离线时消息持久化存储
-3. **连接断线**：WebSocket断线自动重连
-4. **数据备份**：重要数据多副本存储
+##### WebSocket性能优化
+| 优化项 | 具体措施 | 性能指标 | 参考文章 |
+|--------|----------|----------|----------|
+| **连接管理** | 本地+Redis分布式管理 | 支持2-3万并发连接 | [WebSocket性能优化](https://www.cnblogs.com/guoapeng/p/17020317.html) |
+| **消息路由** | RocketMQ智能路由，避免广播 | 消息延迟<200ms | [消息队列性能优化](https://rocketmq.apache.org/docs/bestpractice/) |
+| **心跳机制** | 30秒心跳+60秒检测 | 及时清理僵死连接 | [WebSocket心跳设计](https://www.ruanyifeng.com/blog/2017/05/websocket.html) |
+| **负载均衡** | 无粘性会话，随机分发 | 故障恢复<5秒 | [负载均衡最佳实践](https://nginx.org/en/docs/http/load_balancing.html) |
 
-### 监控告警
-1. **性能监控**：消息发送成功率、延迟监控
-2. **资源监控**：WebSocket连接数、内存使用率
-3. **业务监控**：活跃用户数、消息量统计
-4. **异常告警**：系统异常、性能瓶颈及时告警
+##### 缓存策略
+```java
+// 用户在线状态缓存（Redis）
+user:online:{userId} -> serverId (TTL: 24小时)
 
-### 兼容性保证
-1. **向下兼容**：现有消息系统功能保持不变
-2. **数据兼容**：现有消息数据无缝迁移
-3. **接口兼容**：现有API接口继续可用
-4. **客户端兼容**：支持不同版本客户端接入
+// 会话列表缓存（Redis）
+user:conversations:{userId} -> List<ConversationDTO> (TTL: 1小时)
+
+// 热点消息缓存（Redis）
+conversation:messages:{conversationId} -> List<MessageDTO> (TTL: 30分钟)
+```
+
+#### 16.2 安全防护措施
+
+##### 认证与鉴权
+| 安全层级 | 具体措施 | 安全强度 | 实现方式 |
+|----------|----------|----------|----------|
+| **API网关认证** | 统一token验证 | 高 | JWT + Redis黑名单 |
+| **WebSocket认证** | 握手阶段验证用户身份 | 高 | 网关传递用户信息 |
+| **权限验证** | 操作前验证用户权限 | 中 | 基于角色的权限控制 |
+| **消息过滤** | 敏感词过滤+内容审核 | 中 | 关键词库+AI审核 |
+
+##### 频率限制与防刷
+```java
+// 消息发送频率限制
+user:message:rate:{userId} -> count (TTL: 1分钟, 限制: 100条/分钟)
+
+// 连接频率限制  
+user:connect:rate:{userId} -> count (TTL: 1小时, 限制: 10次/小时)
+
+// IP级别限制
+ip:message:rate:{ip} -> count (TTL: 1分钟, 限制: 1000条/分钟)
+```
+
+**参考资料**：
+- [API安全最佳实践](https://owasp.org/www-project-api-security/)
+- [WebSocket安全防护](https://portswigger.net/web-security/websockets)
+
+#### 16.3 可扩展性设计
+
+##### 水平扩展能力
+| 扩展维度 | 扩展方式 | 扩展上限 | 技术实现 |
+|----------|----------|----------|----------|
+| **应用层扩展** | 无状态服务+负载均衡 | 无理论上限 | Docker + K8S |
+| **数据库扩展** | 分库分表+读写分离 | 千万级数据 | ShardingSphere |
+| **缓存扩展** | Redis集群 | TB级缓存 | Redis Cluster |
+| **消息队列扩展** | RocketMQ集群 | 万级TPS | RocketMQ NameServer |
+
+##### 存储扩展策略
+```sql
+-- 按时间分表（消息表）
+t_msg_body_202412, t_msg_body_202501, ...
+
+-- 按会话ID分库（会话表）  
+conversation_db_0, conversation_db_1, ...
+
+-- 分片键选择
+分片键: conversation_id % 16
+```
+
+**参考资料**：
+- [分库分表实践](https://shardingsphere.apache.org/document/current/cn/overview/)
+- [微服务扩展性设计](https://microservices.io/patterns/data/database-per-service.html)
+
+#### 16.4 容错处理机制
+
+##### 故障恢复策略
+| 故障类型 | 检测方式 | 恢复策略 | 恢复时间 |
+|----------|----------|----------|----------|
+| **服务实例宕机** | 健康检查 | 自动重启+负载转移 | <30秒 |
+| **数据库异常** | 连接监控 | 主从切换 | <60秒 |
+| **Redis故障** | 心跳检测 | 集群故障转移 | <10秒 |
+| **网络分区** | 超时检测 | 断路器+降级 | 立即 |
+
+##### 消息可靠性保证
+```mermaid
+graph TD
+    A[消息发送] --> B{保存到数据库}
+    B -->|成功| C[发送到MQ]
+    B -->|失败| D[返回失败]
+    C -->|成功| E[推送给接收方]
+    C -->|失败| F[标记为离线消息]
+    E -->|推送失败| F
+    F --> G[等待用户上线重试]
+```
+
+**参考资料**：
+- [分布式系统容错设计](https://martinfowler.com/articles/microservice-trade-offs.html)
+- [Netflix容错实践](https://netflixtechblog.com/making-the-netflix-api-more-resilient-a8ec62159c2d)
+
+#### 16.5 监控告警体系
+
+##### 系统监控指标
+| 监控类型 | 关键指标 | 告警阈值 | 监控工具 |
+|----------|----------|----------|----------|
+| **性能监控** | 消息延迟、QPS、响应时间 | 延迟>500ms | Prometheus + Grafana |
+| **资源监控** | CPU、内存、网络、磁盘 | CPU>80% | Node Exporter |
+| **业务监控** | 在线用户数、消息成功率 | 成功率<99% | 自定义指标 |
+| **错误监控** | 异常率、错误日志 | 异常率>1% | ELK Stack |
+
+##### 关键业务指标
+```java
+// 核心业务监控指标
+- 同时在线用户数: user.online.count
+- 消息发送成功率: message.send.success.rate  
+- WebSocket连接数: websocket.connection.count
+- 平均消息延迟: message.latency.avg
+- 会话创建成功率: conversation.create.success.rate
+```
+
+**参考资料**：
+- [微服务监控最佳实践](https://prometheus.io/docs/practices/instrumentation/)
+- [分布式链路追踪](https://opentracing.io/guides/java/)
+
+#### 16.6 兼容性保证
+
+##### 向下兼容策略
+| 兼容维度 | 兼容措施 | 风险等级 | 测试验证 |
+|----------|----------|----------|----------|
+| **数据库兼容** | 只新增字段，不修改现有 | 低 | 自动化测试 |
+| **API兼容** | 新增接口，保留旧接口 | 低 | 接口测试 |
+| **消息格式** | 版本化消息协议 | 中 | 兼容性测试 |
+| **客户端兼容** | 渐进式功能推送 | 中 | 多版本测试 |
+
+##### 版本管理策略
+```java
+// API版本管理
+/api/v1/messages (现有业务消息)
+/api/v1/im/messages (新增IM消息)
+
+// WebSocket协议版本
+{"version": "1.0", "type": "SEND_MESSAGE", "data": {...}}
+
+// 数据库字段兼容
+现有字段: 保持不变
+新增字段: 默认值 + NULL约束
+```
+
+**参考资料**：
+- [API版本管理策略](https://restfulapi.net/versioning/)
+- [向下兼容性设计](https://martinfowler.com/articles/evolvingAPI.html)
+
+#### 16.7 测试保证体系
+
+##### 测试策略
+| 测试类型 | 覆盖范围 | 测试工具 | 目标指标 |
+|----------|----------|----------|----------|
+| **单元测试** | 核心业务逻辑 | JUnit + Mockito | 覆盖率>80% |
+| **集成测试** | 服务间交互 | TestContainers | 主要场景覆盖 |
+| **性能测试** | 并发能力 | JMeter + K6 | 2万并发连接 |
+| **压力测试** | 极限负载 | Artillery | 找到性能瓶颈 |
+
+##### 关键测试场景
+```java
+// 核心功能测试
+1. 单聊消息发送接收
+2. 群聊消息广播  
+3. 消息撤回
+4. 离线消息推送
+5. 会话创建管理
+
+// 异常场景测试
+1. 网络断开重连
+2. 服务重启恢复
+3. 数据库故障切换
+4. Redis故障处理
+5. 消息队列异常
+```
+
+**参考资料**：
+- [测试金字塔实践](https://martinfowler.com/bliki/TestPyramid.html)
+- [WebSocket测试策略](https://www.baeldung.com/spring-websockets-test)
+
+### 质量保证总结
+
+通过以上6个维度的质量保证措施，确保IM系统能够：
+
+1. **高性能**：支持2-3万并发连接，消息延迟<200ms
+2. **高安全**：多层次安全防护，防止恶意攻击
+3. **高可用**：99.9%可用性，故障快速恢复
+4. **可扩展**：支持水平扩展，应对业务增长
+5. **可监控**：全方位监控，及时发现问题
+6. **向下兼容**：平滑升级，不影响现有功能
