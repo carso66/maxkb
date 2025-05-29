@@ -2163,193 +2163,6 @@ flowchart TD
     P --> Z
 ```
 
-## 11. 关键方案设计与选型
-
-### 11.1 多条未读消息前后端交互方案
-
-#### 方案对比分析
-
-当用户进入会话并有多条未读消息时，前后端交互存在以下几种方案：
-
-| 方案 | 交互方式 | 优势 | 劣势 | 适用场景 | 推荐度 |
-|------|----------|------|------|----------|--------|
-| **逐条标记方案** | 每查看一条消息立即发送已读请求 | 数据实时准确 | 网络开销大，用户体验差 | 消息量小的场景 | ⭐⭐ |
-| **离开时批量提交** | 前端记录，离开会话时统一提交 | 网络开销小 | 异常中断会丢失状态 | 网络不稳定环境 | ⭐⭐⭐ |
-| **滚动实时更新** | 根据滚动位置实时更新已读位置 | 用户体验好 | 实现复杂，滚动频繁 | 消息量大的场景 | ⭐⭐⭐⭐ |
-| **防抖批量方案** | 防抖动+批量提交的混合策略 | 平衡性能和体验 | 实现稍复杂 | 通用场景（推荐） | ⭐⭐⭐⭐⭐ |
-
-#### 推荐方案：防抖批量方案
-
-##### 核心设计思路
-```javascript
-// 前端防抖批量标记设计
-class UnreadMarkManager {
-    constructor() {
-        this.pendingMarks = new Set();  // 待标记消息ID集合
-        this.debounceTimer = null;      // 防抖定时器
-        this.DEBOUNCE_DELAY = 1000;     // 防抖延迟1秒
-        this.BATCH_SIZE = 50;           // 批量大小限制
-    }
-    
-    // 标记消息已读
-    markAsRead(messageId) {
-        this.pendingMarks.add(messageId);
-        this.scheduleCommit();
-    }
-    
-    // 防抖调度提交
-    scheduleCommit() {
-        if (this.debounceTimer) {
-            clearTimeout(this.debounceTimer);
-        }
-        
-        this.debounceTimer = setTimeout(() => {
-            this.commitBatch();
-        }, this.DEBOUNCE_DELAY);
-        
-        // 批量大小限制，立即提交
-        if (this.pendingMarks.size >= this.BATCH_SIZE) {
-            clearTimeout(this.debounceTimer);
-            this.commitBatch();
-        }
-    }
-    
-    // 批量提交到服务端
-    async commitBatch() {
-        if (this.pendingMarks.size === 0) return;
-        
-        const messageIds = Array.from(this.pendingMarks);
-        this.pendingMarks.clear();
-        
-        try {
-            await this.apiCall('/api/v1/messages/batch-read', {
-                messageIds: messageIds,
-                conversationId: this.currentConversationId
-            });
-        } catch (error) {
-            // 失败重试机制
-            messageIds.forEach(id => this.pendingMarks.add(id));
-            this.scheduleCommit();
-        }
-    }
-}
-```
-
-##### 服务端批量处理接口
-```java
-/**
- * 批量标记消息已读
- */
-@PostMapping("/batch-read")
-public Response<Boolean> batchMarkMessageRead(@RequestBody BatchMarkReadRequestVO request) {
-    // 参数验证
-    if (request.getMessageIds().size() > 100) {
-        throw new BusinessException("批量标记数量不能超过100条");
-    }
-    
-    // 批量更新数据库（事务保证）
-    boolean success = messageCmdFacade.batchMarkMessageRead(request);
-    
-    // 推送已读状态给其他设备
-    if (success) {
-        pushReadStatusToOtherDevices(request);
-    }
-    
-    return Response.success(success);
-}
-```
-
-#### 特殊场景处理
-
-##### 场景1：快速滚动大量消息
-```javascript
-// 基于视窗的智能标记
-class ViewportBasedMarking {
-    constructor() {
-        this.intersectionObserver = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting && entry.intersectionRatio > 0.5) {
-                    // 消息在视窗中可见超过50%，标记为已读
-                    const messageId = entry.target.dataset.messageId;
-                    this.unreadManager.markAsRead(messageId);
-                }
-            });
-        }, {
-            threshold: [0.5]  // 可见50%以上才算已读
-        });
-    }
-}
-```
-
-##### 场景2：离线重连后状态恢复
-```javascript
-// 离线状态恢复机制
-class OfflineRecoveryManager {
-    // 离线时本地存储未提交的已读状态
-    saveOfflineState() {
-        const offlineData = {
-            conversationId: this.currentConversationId,
-            readMessageIds: Array.from(this.pendingMarks),
-            timestamp: Date.now()
-        };
-        localStorage.setItem('offline_read_state', JSON.stringify(offlineData));
-    }
-    
-    // 重连后恢复并提交
-    async recoverOnlineState() {
-        const offlineData = localStorage.getItem('offline_read_state');
-        if (offlineData) {
-            const data = JSON.parse(offlineData);
-            // 24小时内的离线状态才恢复
-            if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
-                await this.commitOfflineReads(data);
-            }
-            localStorage.removeItem('offline_read_state');
-        }
-    }
-}
-```
-
-##### 场景3：多端状态同步
-```java
-// 多端已读状态同步
-@Component
-public class MultiDeviceReadSyncProcessor {
-    
-    @EventListener
-    public void onMessageRead(MessageReadEvent event) {
-        // 查询用户的其他在线设备
-        List<String> otherDevices = getUserOtherOnlineDevices(event.getReaderId());
-        
-        // 推送已读状态给其他设备
-        ReadStatusSyncMessage syncMessage = ReadStatusSyncMessage.builder()
-                .conversationId(event.getConversationId())
-                .messageId(event.getMessageId())
-                .readTime(event.getReadTime())
-                .build();
-                
-        otherDevices.forEach(deviceId -> {
-            webSocketService.sendToDevice(deviceId, syncMessage);
-        });
-    }
-}
-```
-
-#### 性能优化策略
-
-| 优化维度 | 具体措施 | 性能提升 | 实现复杂度 |
-|----------|----------|----------|------------|
-| **防抖动控制** | 1秒内多次标记合并为一次请求 | 减少50%网络请求 | 低 |
-| **批量提交** | 最多50条消息一次性提交 | 减少数据库事务次数 | 低 |
-| **智能触发** | 视窗可见度+滚动停留时间判断 | 提升用户体验 | 中 |
-| **本地缓存** | 本地记录已读状态，减少重复标记 | 减少无效请求 | 中 |
-| **异常恢复** | 网络异常时本地暂存，恢复后补偿 | 提升可靠性 | 高 |
-
-**参考资料**：
-- [防抖节流最佳实践](https://developer.mozilla.org/en-US/docs/Web/API/Intersection_Observer_API)
-- [IM系统已读状态设计](https://www.cnblogs.com/flashsun/p/14318928.html)
-- [移动端IM优化策略](https://tech.meituan.com/2018/11/15/dianping-im-arch.html)
-
 ## 12. 关键方案设计与选型
 
 ### 核心架构决策
@@ -3102,6 +2915,191 @@ public class WebSocketHeartbeatHandler {
 - 状态管理：Redis集群（集中式存储）
 - 认证：API网关 + 现有token体系
 - 监控：心跳机制 + 连接清理
+
+### 11.1 多条未读消息前后端交互方案
+
+#### 方案对比分析
+
+当用户进入会话并有多条未读消息时，前后端交互存在以下几种方案：
+
+| 方案 | 交互方式 | 优势 | 劣势 | 适用场景 | 推荐度 |
+|------|----------|------|------|----------|--------|
+| **逐条标记方案** | 每查看一条消息立即发送已读请求 | 数据实时准确 | 网络开销大，用户体验差 | 消息量小的场景 | ⭐⭐ |
+| **离开时批量提交** | 前端记录，离开会话时统一提交 | 网络开销小 | 异常中断会丢失状态 | 网络不稳定环境 | ⭐⭐⭐ |
+| **滚动实时更新** | 根据滚动位置实时更新已读位置 | 用户体验好 | 实现复杂，滚动频繁 | 消息量大的场景 | ⭐⭐⭐⭐ |
+| **防抖批量方案** | 防抖动+批量提交的混合策略 | 平衡性能和体验 | 实现稍复杂 | 通用场景（推荐） | ⭐⭐⭐⭐⭐ |
+
+#### 推荐方案：防抖批量方案
+
+##### 核心设计思路
+```javascript
+// 前端防抖批量标记设计
+class UnreadMarkManager {
+    constructor() {
+        this.pendingMarks = new Set();  // 待标记消息ID集合
+        this.debounceTimer = null;      // 防抖定时器
+        this.DEBOUNCE_DELAY = 1000;     // 防抖延迟1秒
+        this.BATCH_SIZE = 50;           // 批量大小限制
+    }
+    
+    // 标记消息已读
+    markAsRead(messageId) {
+        this.pendingMarks.add(messageId);
+        this.scheduleCommit();
+    }
+    
+    // 防抖调度提交
+    scheduleCommit() {
+        if (this.debounceTimer) {
+            clearTimeout(this.debounceTimer);
+        }
+        
+        this.debounceTimer = setTimeout(() => {
+            this.commitBatch();
+        }, this.DEBOUNCE_DELAY);
+        
+        // 批量大小限制，立即提交
+        if (this.pendingMarks.size >= this.BATCH_SIZE) {
+            clearTimeout(this.debounceTimer);
+            this.commitBatch();
+        }
+    }
+    
+    // 批量提交到服务端
+    async commitBatch() {
+        if (this.pendingMarks.size === 0) return;
+        
+        const messageIds = Array.from(this.pendingMarks);
+        this.pendingMarks.clear();
+        
+        try {
+            await this.apiCall('/api/v1/messages/batch-read', {
+                messageIds: messageIds,
+                conversationId: this.currentConversationId
+            });
+        } catch (error) {
+            // 失败重试机制
+            messageIds.forEach(id => this.pendingMarks.add(id));
+            this.scheduleCommit();
+        }
+    }
+}
+```
+
+##### 服务端批量处理接口
+```java
+/**
+ * 批量标记消息已读
+ */
+@PostMapping("/batch-read")
+public Response<Boolean> batchMarkMessageRead(@RequestBody BatchMarkReadRequestVO request) {
+    // 参数验证
+    if (request.getMessageIds().size() > 100) {
+        throw new BusinessException("批量标记数量不能超过100条");
+    }
+    
+    // 批量更新数据库（事务保证）
+    boolean success = messageCmdFacade.batchMarkMessageRead(request);
+    
+    // 推送已读状态给其他设备
+    if (success) {
+        pushReadStatusToOtherDevices(request);
+    }
+    
+    return Response.success(success);
+}
+```
+
+#### 特殊场景处理
+
+##### 场景1：快速滚动大量消息
+```javascript
+// 基于视窗的智能标记
+class ViewportBasedMarking {
+    constructor() {
+        this.intersectionObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting && entry.intersectionRatio > 0.5) {
+                    // 消息在视窗中可见超过50%，标记为已读
+                    const messageId = entry.target.dataset.messageId;
+                    this.unreadManager.markAsRead(messageId);
+                }
+            });
+        }, {
+            threshold: [0.5]  // 可见50%以上才算已读
+        });
+    }
+}
+```
+
+##### 场景2：离线重连后状态恢复
+```javascript
+// 离线状态恢复机制
+class OfflineRecoveryManager {
+    // 离线时本地存储未提交的已读状态
+    saveOfflineState() {
+        const offlineData = {
+            conversationId: this.currentConversationId,
+            readMessageIds: Array.from(this.pendingMarks),
+            timestamp: Date.now()
+        };
+        localStorage.setItem('offline_read_state', JSON.stringify(offlineData));
+    }
+    
+    // 重连后恢复并提交
+    async recoverOnlineState() {
+        const offlineData = localStorage.getItem('offline_read_state');
+        if (offlineData) {
+            const data = JSON.parse(offlineData);
+            // 24小时内的离线状态才恢复
+            if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
+                await this.commitOfflineReads(data);
+            }
+            localStorage.removeItem('offline_read_state');
+        }
+    }
+}
+```
+
+##### 场景3：多端状态同步
+```java
+// 多端已读状态同步
+@Component
+public class MultiDeviceReadSyncProcessor {
+    
+    @EventListener
+    public void onMessageRead(MessageReadEvent event) {
+        // 查询用户的其他在线设备
+        List<String> otherDevices = getUserOtherOnlineDevices(event.getReaderId());
+        
+        // 推送已读状态给其他设备
+        ReadStatusSyncMessage syncMessage = ReadStatusSyncMessage.builder()
+                .conversationId(event.getConversationId())
+                .messageId(event.getMessageId())
+                .readTime(event.getReadTime())
+                .build();
+                
+        otherDevices.forEach(deviceId -> {
+            webSocketService.sendToDevice(deviceId, syncMessage);
+        });
+    }
+}
+```
+
+#### 性能优化策略
+
+| 优化维度 | 具体措施 | 性能提升 | 实现复杂度 |
+|----------|----------|----------|------------|
+| **防抖动控制** | 1秒内多次标记合并为一次请求 | 减少50%网络请求 | 低 |
+| **批量提交** | 最多50条消息一次性提交 | 减少数据库事务次数 | 低 |
+| **智能触发** | 视窗可见度+滚动停留时间判断 | 提升用户体验 | 中 |
+| **本地缓存** | 本地记录已读状态，减少重复标记 | 减少无效请求 | 中 |
+| **异常恢复** | 网络异常时本地暂存，恢复后补偿 | 提升可靠性 | 高 |
+
+**参考资料**：
+- [防抖节流最佳实践](https://developer.mozilla.org/en-US/docs/Web/API/Intersection_Observer_API)
+- [IM系统已读状态设计](https://www.cnblogs.com/flashsun/p/14318928.html)
+- [移动端IM优化策略](https://tech.meituan.com/2018/11/15/dianping-im-arch.html)
 
 ## 13. 接口定义
 
